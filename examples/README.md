@@ -149,7 +149,8 @@ bound to `127.0.0.1`, so Claude Code keeps its usual localhost base URL.
 If the config expands environment variables, add a mode-600 `environment` file
 beside `compose.yaml`, using the `NAME=value` format above. Compose passes it to
 both login and serving containers. `TINYLLM_IMAGE` in your shell or Compose `.env`
-can select a published release tag instead of the default `latest` image.
+can select a release tag or `main-<short-sha>` instead of the default `nightly`
+image. `nightly` updates on successful main-branch builds.
 
 Log in with the shared volume, then start in the background:
 

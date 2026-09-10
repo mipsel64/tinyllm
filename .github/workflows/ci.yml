@@ -52,4 +52,4 @@ jobs:
       contents: read
       packages: write
     with:
-      publish: ${{ github.event_name == 'push' && github.ref_name == github.event.repository.default_branch }}
+      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}

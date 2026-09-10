@@ -2,7 +2,7 @@ name: tinyllm
 
 services:
   tinyllm:
-    image: ${TINYLLM_IMAGE:-ghcr.io/mipsel64/tinyllm:latest}
+    image: ${TINYLLM_IMAGE:-ghcr.io/mipsel64/tinyllm:nightly}
     restart: unless-stopped
     stop_grace_period: 11m
     ports:

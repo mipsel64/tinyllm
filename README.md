@@ -114,8 +114,9 @@ and your local gateway token as its API key (`tinyllm` when auth is disabled).
 ### Run as a service
 
 Use the [macOS launchd, Linux systemd and Docker Compose examples](examples/README.md)
-for boot startup, logs, persistent state and graceful shutdown. Docker images are
-available at `ghcr.io/mipsel64/tinyllm:latest` or a release tag such as `:v0.1.0`.
+for boot startup, logs, persistent state and graceful shutdown. The image
+`ghcr.io/mipsel64/tinyllm` uses `nightly` and `main-<short-sha>` tags for main-branch
+builds, and the Git tag (such as `v0.1.0`) for releases.
 
 ### Manage state
 
