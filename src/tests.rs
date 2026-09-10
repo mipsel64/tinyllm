@@ -13,6 +13,31 @@ use std::sync::{
 };
 
 #[test]
+fn state_cleanup_config_is_optional_and_validated() {
+    for (policy, valid) in [
+        (None, true),
+        (Some(json!({})), true),
+        (Some(json!({"idle_days":7,"interval_seconds":60})), true),
+        (Some(json!({"idle_days":0})), false),
+        (Some(json!({"interval_seconds":0})), false),
+        (Some(json!({"idle_days":u64::MAX})), false),
+        (Some(json!({"interval_seconds":u64::MAX})), false),
+        (Some(json!({"typo":30})), false),
+    ] {
+        let mut value = json!({"providers":{"openai":{"type":"openai","auth":{"type":"ApiKey","options":"fixture"}}}});
+        if let Some(policy) = &policy {
+            value["server"] = json!({"state_cleanup":policy});
+        }
+        let result = serde_json::from_value::<crate::config::Config>(value);
+        assert_eq!(
+            result.is_ok_and(|c| c.validate().is_ok()),
+            valid,
+            "{policy:?}"
+        );
+    }
+}
+
+#[test]
 fn provider_config_uses_native_model_names() {
     let path =
         std::env::temp_dir().join(format!("tinyllm-providers-{}.toml", uuid::Uuid::new_v4()));
@@ -665,6 +690,7 @@ async fn http_fixture(prefix: &str, auth_token: Option<&str>) -> HttpFixture {
     let directory = std::env::temp_dir().join(format!("tinyllm-http-{}", uuid::Uuid::new_v4()));
     let mut cfg = config(upstream, directory.clone());
     cfg.server.auth_token = auth_token.map(str::to_owned);
+    cfg.server.state_cleanup = Some(Default::default());
     let provider = cfg.providers.remove("openai").unwrap();
     cfg.providers.insert(prefix.into(), provider);
     let (gateway, gw_task) = serve(crate::server::router(cfg).await.unwrap()).await;

@@ -103,7 +103,7 @@ async fn authenticate(State(app): State<Arc<AppState>>, request: Request, next: 
 async fn log_request(mut request: Request, next: Next) -> Response {
     let id = uuid::Uuid::new_v4();
     request.extensions_mut().insert(id);
-    let span = tracing::info_span!("request",request_id=%id);
+    let span = tracing::info_span!("request", request_id = %id, method = %request.method(), path = request.uri().path());
     async move {
         let start = Instant::now();
         let response = next.run(request).await;

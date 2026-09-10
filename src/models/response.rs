@@ -2,6 +2,7 @@ use crate::Result;
 use axum::http::HeaderMap;
 use futures::stream::BoxStream;
 use serde_json::Value;
+use std::sync::Arc;
 
 pub struct ModelInfo {
     pub id: String,
@@ -23,4 +24,5 @@ pub enum ResponseBody {
 pub struct ProviderOutput {
     pub headers: HeaderMap,
     pub body: ResponseBody,
+    pub state_pins: Vec<Arc<()>>,
 }

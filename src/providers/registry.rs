@@ -14,6 +14,15 @@ use std::{collections::BTreeMap, sync::Arc};
 
 pub struct Registry {
     providers: BTreeMap<String, Arc<dyn Provider>>,
+    cleanup: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Registry {
+    fn drop(&mut self) {
+        if let Some(cleanup) = &self.cleanup {
+            cleanup.abort();
+        }
+    }
 }
 
 impl Registry {
@@ -25,10 +34,11 @@ impl Registry {
             .any(|p| matches!(p, ProviderConfig::OpenAi(_)))
         {
             Some(Arc::new(
-                Store::open(
+                Store::open_with_cleanup(
                     config.server.state_dir.clone(),
                     config.server.max_state_bytes,
                     config.server.max_response_bytes,
+                    config.server.state_cleanup,
                 )
                 .await?,
             ))
@@ -57,7 +67,24 @@ impl Registry {
             };
             providers.insert(name.clone(), provider);
         }
-        Ok(Self { providers })
+        let cleanup = store.and_then(|store| {
+            config.server.state_cleanup.map(|policy| {
+                let store = Arc::downgrade(&store);
+                tracing::info!(idle_days=policy.idle_days, interval_seconds=policy.interval_seconds, "automatic continuation cleanup enabled");
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(policy.interval_seconds));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        interval.tick().await;
+                        let Some(store) = store.upgrade() else { break; };
+                        if let Err(error) = store.cleanup().await {
+                            tracing::warn!(%error, "continuation cleanup failed; will retry next interval");
+                        }
+                    }
+                })
+            })
+        });
+        Ok(Self { providers, cleanup })
     }
 
     pub fn resolve(&self, public: &str) -> Result<(Arc<dyn Provider>, String)> {
@@ -82,5 +109,67 @@ impl Registry {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[tokio::test]
+    async fn cleanup_runs_on_interval_and_stops_with_registry() {
+        let directory =
+            std::env::temp_dir().join(format!("tinyllm-periodic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(86400 * 60);
+        let marker = directory.join(".cleanup-start");
+        std::fs::write(&marker, b"").unwrap();
+        std::fs::File::open(marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "server":{"state_dir":directory,"state_cleanup":{"idle_days":1,"interval_seconds":1}},
+            "providers":{"openai":{"type":"openai","auth":{"type":"ApiKey","options":"fixture"}}}
+        }))
+        .unwrap();
+        let registry = Registry::new(&config).await.unwrap();
+        let path = directory.join("00000000000000000000000000000001.json");
+        for _ in 0..2 {
+            std::fs::write(&path, b"expired").unwrap();
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("periodic cleanup must run again after its first tick");
+        }
+        let worker = registry.cleanup.as_ref().unwrap().abort_handle();
+        drop(registry);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !worker.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let store = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(store) = Store::open(directory.clone(), 10000, 1000).await {
+                    break store;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("admitted cleanup must release its directory lock");
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
