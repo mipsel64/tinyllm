@@ -1,0 +1,28 @@
+name: tinyllm
+
+services:
+  tinyllm:
+    image: ${TINYLLM_IMAGE:-ghcr.io/mipsel64/tinyllm:latest}
+    restart: unless-stopped
+    stop_grace_period: 11m
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file:
+      - path: ./environment
+        required: false
+    volumes:
+      - type: bind
+        source: ./config.toml
+        target: /etc/tinyllm/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - state:/var/lib/tinyllm
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  state:

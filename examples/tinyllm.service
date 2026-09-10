@@ -1,0 +1,16 @@
+[Unit]
+Description=TinyLLM gateway
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/tinyllm --config %h/.config/tinyllm/config.toml
+Environment=HOME=%h
+Environment=XDG_STATE_HOME=%h/.local/state
+EnvironmentFile=-%h/.config/tinyllm/environment
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=11min
+UMask=0077
+
+[Install]
+WantedBy=default.target

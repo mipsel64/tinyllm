@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.mipsel64.tinyllm</string>
+    <key>UserName</key>
+    <string>__USER__</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/tinyllm</string>
+        <string>--config</string>
+        <string>__HOME__/.config/tinyllm/config.toml</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>XDG_STATE_HOME</key>
+        <string>__HOME__/.local/state</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>660</integer>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/tinyllm/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/tinyllm/stderr.log</string>
+</dict>
+</plist>

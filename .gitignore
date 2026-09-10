@@ -1,0 +1,11 @@
+/target
+/tinyllm.toml
+/tinyllm.yaml
+/tinyllm.yml
+/.tinyllm-state
+/.tinyllm-auth
+
+
+/.claude
+
+.DS_Store

@@ -1,0 +1,151 @@
+# Copy to ~/.config/tinyllm/config.toml, or select a file with --config / -c.
+# TOML and YAML (.yaml/.yml) use the same settings. Restart after editing.
+# This example enables OpenAI subscription login: run tinyllm openai login, then tinyllm.
+# For API keys, switch the OpenAI auth below or enable another provider.
+# At least one provider is required; omit providers you do not use.
+#
+# Environment variables expand before parsing, including inside comments.
+# Empty fallbacks below let unused key examples load without those variables.
+# Once enabled, a key/token must be exported and nonempty. Expansion must leave
+# valid TOML/YAML; use $$ for a literal dollar sign. Paths do not expand ~:
+# use an absolute path, an environment variable, or a path relative to this file.
+
+[server]
+# Listen address and port. Default: loopback only, 127.0.0.1:8080.
+# Clients use /anthropic for Anthropic, or /v1 for OpenAI endpoints.
+bind = "127.0.0.1:8080"
+
+# Optional local authentication; omitted means no authentication.
+# Startup logs a warning when omitted; network bindings remain allowed.
+# Clients send this token as Bearer authorization or x-api-key. For Claude Code,
+# set ANTHROPIC_AUTH_TOKEN to the same value. This is separate from upstream keys.
+# Empty/whitespace tokens are invalid; omit the setting to disable it.
+# auth_token = "${TINYLLM_TOKEN:-}"
+
+# Private reasoning/continuation state and the default subscription auth folder.
+# Default: XDG_STATE_HOME/tinyllm when XDG_STATE_HOME is absolute, otherwise
+# HOME/.local/state/tinyllm. Keep it across restarts to resume conversations.
+# One running gateway may use this state directory at a time.
+# state_dir = "/custom/state/tinyllm"
+
+# Maximum incoming JSON body, in bytes. Default: 8 MiB; must be positive.
+max_request_bytes = 8388608
+
+# Maximum upstream response, including total SSE bytes, and restored continuation
+# size, in bytes. Default: 32 MiB; must be positive. This is not a token limit.
+max_response_bytes = 33554432
+
+# Aggregate continuation storage budget, in bytes. Default: 256 MiB; must be at
+# least max_response_bytes. Records are not automatically evicted; a full store
+# returns an error. Subscription credentials are separate from this budget.
+# Logs a warning at 80%. Inspect with tinyllm state status; stop the gateway and
+# preview tinyllm state prune --older-than-days 30 before adding --apply.
+# Deleted turns cannot resume; the age cutoff uses file modification time.
+max_state_bytes = 268435456
+
+# Optional global cap across inference endpoints, including active streams.
+# Omitted: no local cap; upstream limits apply. A positive value enables the cap
+# and returns HTTP 503 when full. Completion/cancellation releases the slot.
+# max_concurrent_requests = 32
+
+# Deadline for receiving a complete request body, in seconds. Default: 30;
+# must be positive. Expiry returns HTTP 408 and releases the concurrency slot.
+request_body_timeout_seconds = 30
+
+# Total upstream request timeout, including reading its stream, in seconds.
+# Default: 600; must be positive. The connection timeout is fixed at 10 seconds.
+timeout_seconds = 600
+
+# Downstream SSE keep-alive interval, in seconds. Default: 10; must be positive.
+# Emits Anthropic ping events or OpenAI SSE comments; does not extend the timeout.
+keep_alive_seconds = 10
+
+[logging]
+# tracing target filter on stderr. Default: tinyllm=info; dependencies stay quiet.
+# Examples: tinyllm=debug, warn,tinyllm=debug, off. Default logs omit prompt bodies
+# and credentials; enabling dependency trace/debug may expose transport details.
+# Precedence: --log-level > RUST_LOG > this setting.
+level = "tinyllm=info"
+
+# compact (default), full, json, or pretty.
+# Precedence: --log-format > LOG_FORMAT > this setting.
+format = "compact"
+
+# Provider table names define client model prefixes, independently of type.
+# For example, providers.openai routes openai/gpt-5.6-sol to native gpt-5.6-sol.
+# Names accept 1-64 ASCII letters/digits/dots/underscores/hyphens, except . and ..
+# Rename or add instances as needed; use openai login --provider NAME for subscriptions.
+# base_url values are API roots: endpoint paths are appended automatically.
+# HTTPS is required, except HTTP on loopback; no credentials/query/fragment in URLs.
+
+[providers.openai]
+# Supported types: openai, openrouter, zai (lowercase, case-sensitive).
+type = "openai"
+
+# Omit to select the backend from auth: Subscription uses
+# https://chatgpt.com/backend-api/codex; ApiKey uses https://api.openai.com/v1.
+# The following override applies to API keys; leave it unset for subscriptions.
+# base_url = "https://api.openai.com/v1"
+
+# Optional OpenAI organization/project headers; API-key auth only, no defaults.
+# organization = "org-..."
+# project = "proj_..."
+
+[providers.openai.auth]
+# Choose exactly one type. Subscription needs tinyllm openai login before serving;
+# openai login --device-auth uses a device code instead of the local browser callback.
+# Refresh is automatic near expiry and once after an upstream 401.
+type = "Subscription"
+
+# Optional Subscription settings. Default credentials: server.state_dir/auth/
+# openai.json; other instance names use auth/NAME/openai.json. This setting is
+# a directory; relative paths resolve against this config file.
+# options = { credentials_dir = "/custom/private/tinyllm-auth" }
+
+# To use an API key, replace the Subscription type above with these two lines,
+# export OPENAI_API_KEY, and start tinyllm without running login.
+# options is a key string for ApiKey, and a table for Subscription.
+# type = "ApiKey"
+# options = "${OPENAI_API_KEY:-}"
+
+# Model tables are optional: they populate discovery and set request defaults,
+# not an allowlist. Unlisted native IDs are forwarded too. Quote IDs containing
+# dots or slashes. Model availability depends on the upstream account.
+# Clients select the main/small/subagent model; there are no server-side aliases.
+[providers.openai.models."gpt-5.6-sol"]
+# Optional fallback when the client omits effort. Client reasoning controls win.
+# Accepted values: none, minimal, low, medium, high, xhigh, max. Providers map
+# levels for the selected model and reject unsupported controls. Omit this field
+# to leave effort to the client/provider; levels are not exact token budgets.
+reasoning_effort = "medium"
+
+# Optional OpenAI service tier; omitted leaves the client's/upstream's choice.
+# Values: auto, default, flex, priority, fast, ultrafast. Fast is sent as priority.
+# Client service_tier wins, including auto or null on OpenAI endpoints;
+# Anthropic standard_only maps to default and overrides this setting.
+# Fast/priority uses higher subscription credits or API pricing. Model/account
+# support is decided upstream; this does not change reasoning effort.
+# service_tier = "priority"
+
+# [providers.openai.models."gpt-6-astra"]
+# reasoning_effort = "medium"
+
+# Optional OpenRouter provider. Uncomment this block and export OPENROUTER_API_KEY.
+# Clients request openrouter/deepseek/deepseek-4-pro; only the first slash selects
+# the provider, leaving deepseek/deepseek-4-pro as the upstream model ID.
+# [providers.openrouter]
+# type = "openrouter"
+# api_key = "${OPENROUTER_API_KEY:-}"
+# base_url = "https://openrouter.ai/api/v1" # Default; may be omitted.
+# [providers.openrouter.models."deepseek/deepseek-4-pro"]
+# reasoning_effort = "high" # Optional fallback; client controls take precedence.
+
+# Optional Z.ai provider. Uncomment this block and export ZAI_API_KEY.
+# Clients request zai/glm-5.3. The single root below gets /anthropic/v1/messages,
+# /coding/paas/v4/chat/completions or /v1/responses appended for the client format.
+# [providers.zai]
+# type = "zai"
+# api_key = "${ZAI_API_KEY:-}"
+# base_url = "https://api.z.ai/api" # Default; do not append /anthropic yourself.
+# [providers.zai.models."glm-5.3"]
+# reasoning_effort = "high" # Optional fallback; client controls take precedence.
