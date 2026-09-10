@@ -31,7 +31,11 @@ where
                 Ok(event) => {
                     let value = serde_json::from_str::<Value>(&event.data).map_err(|_| Error::upstream("invalid upstream SSE JSON or premature [DONE]"));
                     match value {
-                        Ok(value) if event.event.is_empty() || event.event == "message" || value["type"] == event.event => yield Ok(value),
+                        Ok(value) if event.event.is_empty() || event.event == "message" || value["type"] == event.event => {
+                            if !matches!(value["type"].as_str(), Some("ping" | "keepalive")) {
+                                yield Ok(value);
+                            }
+                        }
                         Ok(_) => {yield Err(Error::upstream("SSE event name does not match its type")); break;}
                         Err(error) => {yield Err(error); break;}
                     }

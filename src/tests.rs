@@ -654,16 +654,25 @@ fn invalid_tool_json_and_upstream_failures_never_become_success() {
 async fn fragmented_stream_preserves_utf8_parallel_arguments_and_completion() {
     use futures::StreamExt;
     let events = stream_fixture();
-    let raw: String = events
+    let heartbeats = concat!(
+        ": keep-alive\r\n\r\n",
+        "event: keepalive\r\ndata:\r\n\r\n",
+        "event: keepalive\r\ndata: {\"type\":\"keepalive\"}\r\n\r\n",
+        "event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n",
+        "data: {\"type\":\"keepalive\"}\r\n\r\n",
+        "event: message\r\ndata: {\"type\":\"ping\"}\r\n\r\n",
+    );
+    let mut raw: String = events
         .iter()
         .map(|e| {
             format!(
-                "event: {}\r\ndata: {}\r\n\r\n",
+                "{heartbeats}event: {}\r\ndata: {}\r\n\r\n",
                 e["type"].as_str().unwrap(),
                 e
             )
         })
         .collect();
+    raw.push_str(heartbeats);
     let upstream = futures::stream::iter(
         raw.bytes()
             .map(|b| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b])))
@@ -710,6 +719,40 @@ async fn fragmented_stream_preserves_utf8_parallel_arguments_and_completion() {
         }
     }
     assert!(open.is_none());
+}
+
+#[tokio::test]
+async fn sse_heartbeats_preserve_validation_and_byte_limits() {
+    use futures::StreamExt;
+    for raw in [
+        "event: keepalive\ndata: {broken}\n\n",
+        "event: keepalive\ndata: {\"type\":\"response.completed\"}\n\n",
+        "event: response.completed\ndata: {\"type\":\"keepalive\"}\n\n",
+        "event: ping\ndata: {\"type\":\"keepalive\"}\n\n",
+        "data: [DONE]\n\n",
+    ]
+    .map(str::to_owned)
+    .into_iter()
+    .chain(["data: {\"type\":\"keepalive\"}\n\n".repeat(100)])
+    {
+        let source = futures::stream::iter([Ok::<_, std::io::Error>(
+            bytes::Bytes::copy_from_slice(raw.as_bytes()),
+        )]);
+        let mut decoded = Box::pin(stream::decode(source, 1024));
+        assert!(decoded.next().await.unwrap().is_err(), "{raw}");
+        assert!(decoded.next().await.is_none());
+    }
+    for event in [
+        json!({"type":"error","message":"upstream failed"}),
+        json!({"type":"response.unknown_semantic_event"}),
+    ] {
+        let source = futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(format!(
+            "data: {{\"type\":\"keepalive\"}}\n\ndata: {event}\n\n"
+        )))]);
+        let mut decoded = Box::pin(stream::decode(source, 1024));
+        assert_eq!(decoded.next().await.unwrap().unwrap(), event);
+        assert!(decoded.next().await.is_none());
+    }
 }
 
 fn stream_fixture() -> Vec<Value> {
@@ -1319,7 +1362,7 @@ async fn subscription_json_stream_tools_reasoning_and_concurrency() {
     events.last_mut().unwrap()["response"]["output"] = json!([]);
     let raw = events
         .iter()
-        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+        .map(|e| format!("data: {{\"type\":\"ping\"}}\n\nevent: {}\ndata: {e}\n\nevent: keepalive\ndata: {{\"type\":\"keepalive\"}}\n\n", e["type"].as_str().unwrap()))
         .collect::<String>();
     let (upstream, up_task) = serve(Router::new().route(
         "/responses",
@@ -1911,6 +1954,7 @@ async fn live_sse_is_incremental_keeps_alive_and_never_finishes_failed_streams()
         let output=async_stream::stream! {
             let first = stream_fixture()[..5].iter().map(|event|format!("event: {}\ndata: {event}\n\n",event["type"].as_str().unwrap())).collect::<String>();
             yield Ok::<_,std::io::Error>(bytes::Bytes::from(first));
+            yield Ok(bytes::Bytes::from_static(b"event: keepalive\ndata: {\"type\":\"keepalive\"}\n\n"));
             tokio::time::sleep(std::time::Duration::from_millis(1150)).await;
             if req["max_output_tokens"] == 13 {
                 yield Ok(bytes::Bytes::from_static(b"event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"backend failed upstream-secret\"}\n\n"));
