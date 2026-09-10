@@ -41,22 +41,34 @@ in again, logging out or applying `tinyllm state prune`.
 
 [tinyllm.plist](tinyllm.plist) is a LaunchDaemon that starts at boot and runs as
 your normal user. It remains available after logout. launchd does not expand
-`~`, `$HOME` or other shell syntax in plist paths.
+`~`, `$HOME` or other shell syntax in plist paths. Run this as your normal user
+to fill the template with your actual account and paths:
 
 ```sh
 mkdir -p "$HOME/Library/Logs/tinyllm"
 chmod 700 "$HOME/Library/Logs/tinyllm"
-cp -n examples/tinyllm.plist "$HOME/.config/tinyllm/tinyllm.plist"
+tinyllm_plist="$HOME/.config/tinyllm/tinyllm.plist"
+test -e "$tinyllm_plist" || cp examples/tinyllm.plist "$tinyllm_plist"
+plutil -replace UserName -string "$(id -un)" "$tinyllm_plist"
+plutil -remove ProgramArguments.0 "$tinyllm_plist"
+plutil -insert ProgramArguments.0 -string "$HOME/.local/bin/tinyllm" "$tinyllm_plist"
+plutil -remove ProgramArguments.2 "$tinyllm_plist"
+plutil -insert ProgramArguments.2 -string "$HOME/.config/tinyllm/config.toml" "$tinyllm_plist"
+plutil -replace EnvironmentVariables.HOME -string "$HOME" "$tinyllm_plist"
+plutil -replace EnvironmentVariables.XDG_STATE_HOME -string "$HOME/.local/state" "$tinyllm_plist"
+plutil -replace StandardOutPath -string "$HOME/Library/Logs/tinyllm/stdout.log" "$tinyllm_plist"
+plutil -replace StandardErrorPath -string "$HOME/Library/Logs/tinyllm/stderr.log" "$tinyllm_plist"
 ```
 
-Edit that copy: replace every `__HOME__` with your absolute home path and
-`__USER__` with the result of `id -un`. Keep credentials in the private config;
-the installed plist is readable by other users. launchd does not inherit your
+Adjust the executable and config paths if you installed them elsewhere.
+Keep credentials in the private config; the installed plist is readable by other
+users. launchd does not inherit your
 terminal's environment or load a shell profile. Config references to environment
 variables need corresponding `EnvironmentVariables` entries, or literal values
 in the private config.
 
-Install and start:
+Install and start. If the service is already loaded, first run
+`sudo launchctl bootout system/io.github.mipsel64.tinyllm`, then reinstall:
 
 ```sh
 plutil -lint "$HOME/.config/tinyllm/tinyllm.plist"
@@ -66,6 +78,12 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/io.github.mipsel64.tinyll
 sudo launchctl print system/io.github.mipsel64.tinyllm
 tail -f "$HOME/Library/Logs/tinyllm/stderr.log"
 ```
+
+In `launchctl print`, look for `state = running` and a `pid`, then check the
+current log for `tinyllm listening`. `state = spawn scheduled` means it is waiting
+to launch, not running. If the output still contains `__HOME__` or `__USER__`, the
+unfilled template was installed; rerun the preparation above, bootout, reinstall
+and bootstrap. `plutil -lint` checks syntax only and accepts those placeholders.
 
 Restart gracefully after a config or binary update:
 
