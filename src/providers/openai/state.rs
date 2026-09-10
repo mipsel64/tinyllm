@@ -451,6 +451,14 @@ impl Store {
                 index += 1;
             }
             if !content.iter().any(|b| b["type"] == "redacted_thinking") {
+                // Claude's explicit worker bootstrap starts a new reasoning context.
+                if is_fork_bootstrap(&content, messages.get(index)) {
+                    tracing::debug!(
+                        assistant_message_index = first,
+                        "Claude fork reasoning boundary"
+                    );
+                    continue;
+                }
                 // Claude Code repeats this acknowledgement when resuming local commands.
                 if local_command
                     && content.len() == 1
@@ -561,6 +569,46 @@ impl Store {
         }
         Ok(restored)
     }
+}
+
+fn is_fork_bootstrap(content: &[Value], next: Option<&Value>) -> bool {
+    let Some(results) = next
+        .filter(|message| message["role"] == "user")
+        .and_then(|message| message["content"].as_array())
+    else {
+        return false;
+    };
+    let Some(text) = results
+        .get(content.len())
+        .filter(|block| block["type"] == "text")
+        .and_then(|block| block["text"].as_str())
+    else {
+        return false;
+    };
+    let Some((context, directive)) = text.split_once("</fork-boilerplate>\n\nYour directive: ")
+    else {
+        return false;
+    };
+    if !context.starts_with("<fork-boilerplate>\nYou are a worker fork. The transcript above is the parent's history — inherited reference, not your situation. You are NOT a continuation of that agent. Execute ONE directive, then stop.")
+        || directive.trim().is_empty()
+    {
+        return false;
+    }
+    !content.is_empty()
+        && content.iter().zip(results).all(|(call, result)| {
+            call["type"] == "tool_use"
+                && call["name"] == "Agent"
+                && call["input"]["subagent_type"] == "fork"
+                && call["id"].as_str().is_some_and(|id| !id.is_empty())
+                && result["type"] == "tool_result"
+                && result["tool_use_id"] == call["id"]
+                && result.get("is_error").is_none_or(|value| value == false)
+                && result["content"].as_array().is_some_and(|parts| {
+                    parts.len() == 1
+                        && parts[0]["type"] == "text"
+                        && parts[0]["text"] == "Fork started — processing in background"
+                })
+        })
 }
 
 fn cleanup_grace(
