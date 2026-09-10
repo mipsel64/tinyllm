@@ -445,7 +445,7 @@ pub fn finish(response: &AnthropicResponse) -> [StreamEvent; 2] {
         StreamEvent::MessageDelta {
             delta: MessageDeltaData {
                 stop_reason: response.stop_reason.clone(),
-                stop_sequence: None,
+                stop_sequence: response.stop_sequence.clone(),
             },
             usage: DeltaUsage {
                 input_tokens: Some(response.usage.input_tokens),

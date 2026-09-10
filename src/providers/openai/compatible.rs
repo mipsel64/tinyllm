@@ -113,7 +113,7 @@ pub async fn execute(
             let native = tracker.finish()?;
             if is_chat {
                 let response = chat_response(&native, &public_model, &reference)?;
-                store.save_scoped(&reference, &context.provider, &model.id, &native, request::continuation(&response["choices"][0]["message"])?).await?;
+                store.save_scoped(&reference, &context.provider, &model.id, &native, request::continuation(&response["choices"][0]["message"])?, &Default::default()).await?;
                 for chunk in chat.finish(&response, include_usage)? { yield ApiEvent::ChatCompletions(chunk); }
                 yield ApiEvent::Done;
             }
@@ -152,6 +152,7 @@ pub async fn execute(
                     &model.id,
                     &native,
                     request::continuation(&response["choices"][0]["message"])?,
+                    &Default::default(),
                 )
                 .await?;
             ResponseBody::Json(response)
