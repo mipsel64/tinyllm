@@ -10,6 +10,11 @@ use std::{
 };
 use tokio::{fs, sync::Mutex};
 
+mod sqlite;
+
+pub use sqlite::FILE as DATABASE_FILE;
+use sqlite::{Database, Loaded};
+
 pub const PREFIX: &str = "tinyllm:v1:";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -83,15 +88,14 @@ pub(super) fn tool_defaults(tools: &Value) -> BTreeMap<String, BTreeMap<String, 
         .collect()
 }
 
-#[derive(Default)]
 struct Bookkeeping {
     bytes: u64,
-    pins: BTreeMap<PathBuf, Weak<()>>,
+    pins: BTreeMap<String, Weak<()>>,
+    database: Database,
 }
 
 #[derive(Clone)]
 pub struct Store {
-    directory: PathBuf,
     _lock: Arc<std::fs::File>,
     used: Arc<Mutex<Bookkeeping>>,
     limit: u64,
@@ -121,28 +125,38 @@ impl Store {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await?;
         }
-        let lock = lock_directory(&directory)?;
-        let cleanup = cleanup_grace(&directory, retention)?;
-        let usage = Self::status(&directory).await?;
-        tracing::info!(
-            state_records = usage.records,
-            state_temporary_files = usage.temporary_files,
-            state_bytes = usage.bytes,
-            max_state_bytes = limit,
-            "continuation state usage"
-        );
-        warn_if_high(usage, limit);
-        Ok(Self {
-            directory,
-            _lock: Arc::new(lock),
-            used: Arc::new(Mutex::new(Bookkeeping {
-                bytes: usage.bytes,
+        tokio::task::spawn_blocking(move || {
+            let lock = lock_directory(&directory)?;
+            let cleanup = cleanup_grace(&directory, retention)?;
+            let mut database = Database::open(&directory, true)?;
+            database.migrate(&directory)?;
+            let mut report = PruneReport {
+                before: database.usage(None)?,
                 ..Default::default()
-            })),
-            limit,
-            record_limit,
-            cleanup,
+            };
+            scan_files(&directory, None, false, &mut report)?;
+            let usage = report.before;
+            tracing::info!(
+                state_records = usage.records,
+                state_temporary_files = usage.temporary_files,
+                state_bytes = usage.bytes,
+                max_state_bytes = limit,
+                "continuation state usage"
+            );
+            warn_if_high(usage, limit);
+            Ok(Self {
+                _lock: Arc::new(lock),
+                used: Arc::new(Mutex::new(Bookkeeping {
+                    bytes: usage.bytes,
+                    pins: BTreeMap::new(),
+                    database,
+                })),
+                limit,
+                record_limit,
+                cleanup,
+            })
         })
+        .await?
     }
 
     pub(crate) async fn cleanup(&self) -> eyre::Result<Usage> {
@@ -152,11 +166,16 @@ impl Store {
     async fn cleanup_at(&self, now: SystemTime) -> eyre::Result<Usage> {
         let mut used = self.used.clone().lock_owned().await;
         let store = self.clone();
-        tokio::task::spawn_blocking(move || store.cleanup_locked(&mut used, now)).await?
+        tokio::task::spawn_blocking(move || store.cleanup_locked(&mut used, now, None)).await?
     }
 
-    fn cleanup_locked(&self, used: &mut Bookkeeping, now: SystemTime) -> eyre::Result<Usage> {
-        let mut removed = Usage::default();
+    fn cleanup_locked(
+        &self,
+        used: &mut Bookkeeping,
+        now: SystemTime,
+        needed: Option<u64>,
+    ) -> eyre::Result<Usage> {
+        let removed = Usage::default();
         let Some((retention, grace)) = self.cleanup else {
             return Ok(removed);
         };
@@ -167,33 +186,11 @@ impl Store {
         if grace >= cutoff {
             return Ok(removed);
         }
-        // ponytail: scan under the write lock; index records if directory scans become costly.
-        let result = (|| -> eyre::Result<()> {
-            for entry in std::fs::read_dir(&self.directory)? {
-                let entry = entry?;
-                let name = entry.file_name();
-                if !matches!(record_name(&name), Some((_, false))) {
-                    continue;
-                }
-                let path = entry.path();
-                if used.pins.contains_key(&path) {
-                    continue;
-                }
-                let metadata = match std::fs::symlink_metadata(&path) {
-                    Ok(metadata) if metadata.is_file() => metadata,
-                    Ok(_) => continue,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error.into()),
-                };
-                if metadata.modified()? >= cutoff {
-                    continue;
-                }
-                std::fs::remove_file(&path)?;
-                used.bytes = used.bytes.saturating_sub(metadata.len());
-                removed.add(metadata.len(), false)?;
-            }
-            Ok(())
-        })();
+        let removed = used
+            .database
+            .prune(cutoff, &used.pins, needed)
+            .wrap_err_with(|| "cannot clean expired continuation state")?;
+        used.bytes = used.bytes.saturating_sub(removed.bytes);
         if removed.records > 0 {
             tracing::info!(
                 removed_records = removed.records,
@@ -202,29 +199,32 @@ impl Store {
                 "expired continuation state removed"
             );
         }
-        result.wrap_err_with(|| "cannot clean expired continuation state")?;
         Ok(removed)
     }
 
     pub async fn pin(&self, reference: &str) -> Result<Option<Arc<()>>> {
-        let path = self.path(reference)?;
+        let id = Self::id(reference)?.to_owned();
         if self.cleanup.is_none() {
             return Ok(None);
         }
         let mut used = self.used.lock().await;
         used.pins.retain(|_, pin| pin.strong_count() > 0);
-        Ok(Some(Self::pin_locked(&mut used, path)))
+        Ok(Some(Self::pin_locked(&mut used, id)))
     }
 
-    fn pin_locked(used: &mut Bookkeeping, path: PathBuf) -> Arc<()> {
-        let entry = used.pins.entry(path).or_default();
+    fn pin_locked(used: &mut Bookkeeping, id: String) -> Arc<()> {
+        let entry = used.pins.entry(id).or_default();
         let pin = entry.upgrade().unwrap_or_else(|| Arc::new(()));
         *entry = Arc::downgrade(&pin);
         pin
     }
 
     pub async fn status(directory: &Path) -> eyre::Result<Usage> {
-        Ok(scan(directory, None, false).await?.before)
+        if !directory_exists(directory).await? {
+            return Ok(Usage::default());
+        }
+        let directory = directory.to_owned();
+        tokio::task::spawn_blocking(move || Ok(scan(&directory, None, false)?.before)).await?
     }
 
     pub async fn prune(
@@ -235,20 +235,24 @@ impl Store {
         if !directory_exists(directory).await? {
             return Ok(PruneReport::default());
         }
-        let _lock = lock_directory(directory)?;
-        scan(directory, Some(cutoff), apply).await
+        let directory = directory.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let _lock = lock_directory(&directory)?;
+            scan(&directory, Some(cutoff), apply)
+        })
+        .await?
     }
 
     pub fn reference() -> String {
         format!("{PREFIX}{}", uuid::Uuid::new_v4().simple())
     }
 
-    fn path(&self, reference: &str) -> Result<PathBuf> {
+    fn id(reference: &str) -> Result<&str> {
         let id = reference
             .strip_prefix(PREFIX)
             .filter(|id| id.len() == 32 && id.bytes().all(|c| c.is_ascii_hexdigit()))
             .ok_or_else(|| Error::invalid("invalid tinyllm continuation reference"))?;
-        Ok(self.directory.join(format!("{id}.json")))
+        Ok(id)
     }
 
     pub async fn save(
@@ -299,47 +303,33 @@ impl Store {
         if data.len() > self.record_limit {
             return Err(Error::upstream("continuation exceeds max_response_bytes"));
         }
-        let path = self.path(reference)?;
+        let id = Self::id(reference)?.to_owned();
         let mut used = self.used.clone().lock_owned().await;
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
+            if used.database.contains(&id).map_err(|error| state_error("cannot inspect continuation state", error))? {
+                return Err(Error::upstream("continuation reference already exists"));
+            }
+            if data.len() as u64 > store.limit {
+                return Err(Error::upstream("continuation exceeds max_state_bytes"));
+            }
             if used.bytes.checked_add(data.len() as u64).is_none_or(|n| n > store.limit) {
-                store.cleanup_locked(&mut used, SystemTime::now())
-                    .map_err(|_| Error::upstream("cannot clean expired continuation state"))?;
+                let needed = used.bytes.saturating_add(data.len() as u64).saturating_sub(store.limit);
+                store.cleanup_locked(&mut used, SystemTime::now(), Some(needed))
+                    .map_err(|error| state_error("cannot clean expired continuation state", error))?;
             }
             let next = used.bytes.checked_add(data.len() as u64)
                 .filter(|n| *n <= store.limit)
                 .ok_or_else(|| Error::upstream("continuation store is full; increase max_state_bytes or stop the gateway and run tinyllm state prune"))?;
             let was_high = Usage { bytes: used.bytes, ..Default::default() }.is_high(store.limit);
-            let temporary = path.with_extension("tmp");
-            if path.try_exists().map_err(|_| Error::upstream("cannot inspect continuation state"))? {
-                return Err(Error::upstream("continuation reference already exists"));
-            }
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)
-                .map_err(|_| Error::upstream("cannot create continuation state"))?;
-            use std::io::Write;
-            let write = file.write_all(&data)
-                .and_then(|_| file.sync_all())
-                .and_then(|_| std::fs::rename(&temporary, &path));
-            if write.is_err() {
-                if std::fs::remove_file(&temporary).is_err() {
-                    used.bytes = used.bytes.saturating_add(file.metadata().map_or(data.len() as u64, |m| m.len()));
-                }
-                return Err(Error::upstream("cannot persist continuation state"));
-            }
+            used.database.save(&id, &data, SystemTime::now())
+                .map_err(|error| state_error("cannot persist continuation state", error))?;
             used.bytes = next;
             if !was_high {
                 warn_if_high(Usage { bytes: used.bytes, ..Default::default() }, store.limit);
             }
             Ok(())
-        }).await.map_err(|_| Error::upstream("continuation write failed"))?
+        }).await.map_err(|error| state_error("continuation write failed", error))?
     }
 
     pub async fn save_scoped(
@@ -420,8 +410,8 @@ impl Store {
                 .flatten()
                 .filter(|block| block["type"] == "redacted_thinking")
             {
-                let path = self.path(protocol::string(block, "data")?)?;
-                pins.push(Self::pin_locked(&mut used, path));
+                let id = Self::id(protocol::string(block, "data")?)?.to_owned();
+                pins.push(Self::pin_locked(&mut used, id));
             }
         }
         let mut index = 0;
@@ -451,6 +441,14 @@ impl Store {
                 index += 1;
             }
             if !content.iter().any(|b| b["type"] == "redacted_thinking") {
+                // Claude's explicit worker bootstrap starts a new reasoning context.
+                if is_fork_bootstrap(&content, messages.get(index)) {
+                    tracing::debug!(
+                        assistant_message_index = first,
+                        "Claude fork reasoning boundary"
+                    );
+                    continue;
+                }
                 // Claude Code repeats this acknowledgement when resuming local commands.
                 if local_command
                     && content.len() == 1
@@ -482,24 +480,31 @@ impl Store {
                 if !references.insert(reference.to_owned()) {
                     return Err(Error::invalid("duplicate continuation reference"));
                 }
-                let path = self.path(reference)?;
-                if !fs::symlink_metadata(&path).await.is_ok_and(|m| m.is_file()) {
-                    return Err(Error::invalid(
-                        "continuation state is missing or not a regular file; restore the state directory or start a new conversation",
-                    ));
-                }
-                let file = fs::File::open(&path).await.map_err(|_| Error::invalid("continuation state is missing; restore the state directory or start a new conversation"))?;
-                use tokio::io::AsyncReadExt;
-                let mut data = Vec::new();
-                file.take(self.record_limit as u64 + 1)
-                    .read_to_end(&mut data)
-                    .await
-                    .map_err(|_| Error::upstream("cannot read continuation state"))?;
-                if data.len() > self.record_limit {
-                    return Err(Error::upstream(
-                        "continuation record exceeds configured limit",
-                    ));
-                }
+                let id = Self::id(reference)?.to_owned();
+                // ponytail: reads queue behind writes; batch restores, then add readers if contention matters.
+                let used = self.used.clone().lock_owned().await;
+                let limit = self.record_limit;
+                let store = self.clone();
+                let data = tokio::task::spawn_blocking(move || {
+                    let _store = store;
+                    used.database.load(&id, limit)
+                })
+                .await
+                .map_err(|error| state_error("continuation read failed", error))?
+                .map_err(|error| state_error("cannot read continuation state", error))?;
+                let data = match data {
+                    Loaded::Data(data) => data,
+                    Loaded::Missing => {
+                        return Err(Error::invalid(
+                            "continuation state is missing; restore the state directory or start a new conversation",
+                        ));
+                    }
+                    Loaded::TooLarge => {
+                        return Err(Error::upstream(
+                            "continuation record exceeds configured limit",
+                        ));
+                    }
+                };
                 restored_bytes = restored_bytes.checked_add(data.len()).filter(|n| *n <= self.record_limit).ok_or_else(|| Error::invalid("restored continuation history exceeds max_response_bytes; compact the conversation"))?;
                 let record: Record = serde_json::from_slice(&data)
                     .map_err(|_| Error::upstream("corrupt continuation state"))?;
@@ -540,27 +545,67 @@ impl Store {
             }
         }
         if self.cleanup.is_some() && !references.is_empty() {
-            let paths: Vec<_> = references
+            let ids = references
                 .iter()
-                .map(|r| self.path(r))
+                .map(|r| Self::id(r).map(str::to_owned))
                 .collect::<Result<_>>()?;
-            let used = self.used.clone().lock_owned().await;
+            let mut used = self.used.clone().lock_owned().await;
             let store = self.clone();
-            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                let (_used, _store) = (used, store);
-                let now = SystemTime::now();
-                for path in paths {
-                    let file = std::fs::File::open(path)?;
-                    file.set_modified(now.max(file.metadata()?.modified()?))?;
-                }
-                Ok(())
+            tokio::task::spawn_blocking(move || {
+                let _store = store;
+                used.database.touch(&ids, SystemTime::now())
             })
             .await
-            .map_err(|_| Error::upstream("continuation timestamp update failed"))?
-            .map_err(|_| Error::upstream("cannot update continuation timestamp"))?;
+            .map_err(|error| state_error("continuation timestamp update failed", error))?
+            .map_err(|error| state_error("cannot update continuation timestamp", error))?;
         }
         Ok(restored)
     }
+}
+
+fn state_error(message: &'static str, error: impl std::fmt::Display) -> Error {
+    tracing::warn!(error = %format_args!("{error:#}"), "{message}");
+    Error::upstream(message)
+}
+
+fn is_fork_bootstrap(content: &[Value], next: Option<&Value>) -> bool {
+    let Some(results) = next
+        .filter(|message| message["role"] == "user")
+        .and_then(|message| message["content"].as_array())
+    else {
+        return false;
+    };
+    let Some(text) = results
+        .get(content.len())
+        .filter(|block| block["type"] == "text")
+        .and_then(|block| block["text"].as_str())
+    else {
+        return false;
+    };
+    let Some((context, directive)) = text.split_once("</fork-boilerplate>\n\nYour directive: ")
+    else {
+        return false;
+    };
+    if !context.starts_with("<fork-boilerplate>\nYou are a worker fork. The transcript above is the parent's history — inherited reference, not your situation. You are NOT a continuation of that agent. Execute ONE directive, then stop.")
+        || directive.trim().is_empty()
+    {
+        return false;
+    }
+    !content.is_empty()
+        && content.iter().zip(results).all(|(call, result)| {
+            call["type"] == "tool_use"
+                && call["name"] == "Agent"
+                && call["input"]["subagent_type"] == "fork"
+                && call["id"].as_str().is_some_and(|id| !id.is_empty())
+                && result["type"] == "tool_result"
+                && result["tool_use_id"] == call["id"]
+                && result.get("is_error").is_none_or(|value| value == false)
+                && result["content"].as_array().is_some_and(|parts| {
+                    parts.len() == 1
+                        && parts[0]["type"] == "text"
+                        && parts[0]["text"] == "Fork started — processing in background"
+                })
+        })
 }
 
 fn cleanup_grace(
@@ -645,58 +690,63 @@ fn lock_directory(directory: &Path) -> eyre::Result<std::fs::File> {
     Ok(lock)
 }
 
-async fn scan(
+fn scan(directory: &Path, cutoff: Option<SystemTime>, apply: bool) -> eyre::Result<PruneReport> {
+    let mut report = PruneReport::default();
+    let database_exists = match std::fs::symlink_metadata(directory.join(sqlite::FILE)) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).wrap_err_with(|| "cannot inspect state database"),
+    };
+    if database_exists {
+        let mut database = Database::open(directory, apply)?;
+        report.before = database.usage(None)?;
+        report.selected = match cutoff {
+            Some(cutoff) => database.usage(Some(cutoff))?,
+            None => Usage::default(),
+        };
+        if apply && let Some(cutoff) = cutoff {
+            database.prune(cutoff, &BTreeMap::new(), None)?;
+        }
+        report.after = database.usage(None)?;
+    }
+    scan_files(directory, cutoff, apply, &mut report)?;
+    Ok(report)
+}
+
+fn scan_files(
     directory: &Path,
     cutoff: Option<SystemTime>,
     apply: bool,
-) -> eyre::Result<PruneReport> {
-    let mut report = PruneReport::default();
-    if !directory_exists(directory).await? {
-        return Ok(report);
-    }
-    let mut entries = fs::read_dir(directory)
-        .await
-        .wrap_err_with(|| format!("cannot read state directory {}", directory.display()))?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .wrap_err_with(|| format!("cannot read state directory {}", directory.display()))?
-    {
+    report: &mut PruneReport,
+) -> eyre::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
         let name = entry.file_name();
         let Some((_, temporary)) = record_name(&name) else {
             continue;
         };
         let path = entry.path();
-        let metadata = match fs::symlink_metadata(&path).await {
+        let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() => metadata,
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error)
-                    .wrap_err_with(|| format!("cannot inspect state file {}", path.display()));
-            }
+            Err(error) => return Err(error).wrap_err_with(|| "cannot inspect continuation file"),
         };
         report.before.add(metadata.len(), temporary)?;
         let selected = match cutoff {
-            Some(cutoff) => {
-                metadata.modified().wrap_err_with(|| {
-                    format!("cannot read modification time for {}", path.display())
-                })? < cutoff
-            }
+            Some(cutoff) => metadata.modified()? < cutoff,
             None => false,
         };
         if selected {
             report.selected.add(metadata.len(), temporary)?;
             if apply {
-                fs::remove_file(&path)
-                    .await
-                    .wrap_err_with(|| format!("cannot remove state file {}", path.display()))?;
+                std::fs::remove_file(&path).wrap_err_with(|| "cannot remove continuation file")?;
                 continue;
             }
         }
         report.after.add(metadata.len(), temporary)?;
     }
-    Ok(report)
+    Ok(())
 }
 
 fn warn_if_high(usage: Usage, limit: u64) {
@@ -713,6 +763,152 @@ fn warn_if_high(usage: Usage, limit: u64) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn migration_survives_lowered_response_and_store_limits() {
+        let directory =
+            std::env::temp_dir().join(format!("tinyllm-migrate-limits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let reference = Store::reference();
+        let content = json!([{"type":"redacted_thinking","data":reference}]);
+        let output = json!([{"type":"reasoning","encrypted_content":"x".repeat(20000)}]);
+        let record = json!({"model":"openai/m","content":content,"output":output});
+        let path = directory.join(format!("{}.json", Store::id(&reference).unwrap()));
+        let bytes = serde_json::to_vec(&record).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let request = json!({"messages":[{"role":"assistant","content":content}]});
+        let store = Store::open(directory.clone(), 4096, 1024).await.unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            Store::status(&directory).await.unwrap().bytes,
+            bytes.len() as u64
+        );
+        assert!(
+            store
+                .restore_scoped(&request, "openai", "m")
+                .await
+                .unwrap_err()
+                .message
+                .contains("exceeds configured limit")
+        );
+        drop(store);
+        let store = Store::open(directory.clone(), 100000, 100000)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.restore_scoped(&request, "openai", "m").await.unwrap()[&0],
+            *output.as_array().unwrap()
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_migrates_existing_references_and_keeps_credentials_as_files() {
+        let directory =
+            std::env::temp_dir().join(format!("tinyllm-migrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(directory.join("auth")).unwrap();
+        std::fs::write(directory.join("auth/openai.json"), b"credentials").unwrap();
+        let reference = "tinyllm:v1:00000000000000000000000000000001";
+        let content = json!([{"type":"redacted_thinking","data":reference}]);
+        let record = json!({"model":"openai/m", "content":content,
+            "output":[{"type":"reasoning","encrypted_content":"original"}]});
+        let legacy = directory.join("00000000000000000000000000000001.json");
+        std::fs::write(&legacy, serde_json::to_vec(&record).unwrap()).unwrap();
+        let request = json!({"messages":[{"role":"assistant","content":content}]});
+        let store = Store::open(directory.clone(), 10000, 1000).await.unwrap();
+        assert_eq!(
+            store.restore_scoped(&request, "openai", "m").await.unwrap()[&0],
+            record["output"].as_array().unwrap().clone()
+        );
+        assert!(
+            !legacy.exists(),
+            "committed migration must retire the source file"
+        );
+        assert!(
+            std::fs::read(directory.join("state.sqlite"))
+                .unwrap()
+                .starts_with(b"SQLite format 3\0")
+        );
+        drop(store);
+        let store = Store::open(directory.clone(), 10000, 1000).await.unwrap();
+        assert!(store.restore_scoped(&request, "openai", "m").await.is_ok());
+        assert_eq!(Store::status(&directory).await.unwrap().records, 1);
+        assert_eq!(
+            std::fs::read(directory.join("auth/openai.json")).unwrap(),
+            b"credentials"
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_save_under_pressure_does_not_evict_history() {
+        let directory =
+            std::env::temp_dir().join(format!("tinyllm-duplicate-quota-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(86400 * 60);
+        write_at(&directory, ".cleanup-start", b"", old);
+        let store =
+            Store::open_with_cleanup(directory.clone(), 100, 100, Some(StateCleanup::default()))
+                .await
+                .unwrap();
+        let reference = Store::reference();
+        let response = json!({"output":[]});
+        store
+            .save(&reference, "m", &response, json!([]))
+            .await
+            .unwrap();
+        set_last_used(&store, &reference, old).await;
+        let second = Store::reference();
+        store
+            .save(&second, "m", &response, json!([]))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .save(&reference, "m", &response, json!([]))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            last_used(&store, &reference).await,
+            sqlite::timestamp(old).unwrap()
+        );
+        assert_eq!(Store::status(&directory).await.unwrap().records, 2);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_sqlite_saves_keep_quota_consistent_after_restart() {
+        let directory = std::env::temp_dir().join(format!(
+            "tinyllm-sqlite-concurrent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(directory.clone(), 200, 100).await.unwrap();
+        let results = futures::future::join_all((0..20).map(|_| {
+            let store = store.clone();
+            async move {
+                store
+                    .save(&Store::reference(), "m", &json!({"output":[]}), json!([]))
+                    .await
+            }
+        }))
+        .await;
+        let successful = results.iter().filter(|result| result.is_ok()).count();
+        assert!(successful > 0 && successful < 20);
+        let before = Store::status(&directory).await.unwrap();
+        assert_eq!(before.records, successful as u64);
+        assert!(before.bytes <= 200);
+        assert_eq!(before.bytes, store.used.lock().await.bytes);
+        drop(store);
+        let store = Store::open(directory.clone(), 200, 100).await.unwrap();
+        assert_eq!(Store::status(&directory).await.unwrap(), before);
+        assert_eq!(store.used.lock().await.bytes, before.bytes);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn rejected_histories_do_not_accumulate_dead_pins() {
@@ -777,9 +973,7 @@ mod tests {
                 "completed output pins must not accumulate"
             );
             assert!(Arc::ptr_eq(
-                &used.pins[&store.path(&reference).unwrap()]
-                    .upgrade()
-                    .unwrap(),
+                &used.pins[Store::id(&reference).unwrap()].upgrade().unwrap(),
                 &second
             ));
         }
@@ -819,7 +1013,16 @@ mod tests {
             assert!(futures::poll!(&mut queued).is_pending());
             drop(queued);
             drop(guard);
-            assert!(!store.path(&reference).unwrap().exists());
+            assert_eq!(
+                store
+                    .used
+                    .lock()
+                    .await
+                    .database
+                    .load(Store::id(&reference).unwrap(), 1000)
+                    .unwrap(),
+                Loaded::Missing
+            );
             for cleanup in [false, true] {
                 let (release, blocked) = std::sync::mpsc::channel();
                 let (started, ready) = tokio::sync::oneshot::channel();
@@ -857,7 +1060,12 @@ mod tests {
                 release.send(()).unwrap();
                 blocker.await.unwrap();
                 let used = store.used.lock().await;
-                assert_eq!(store.path(&reference).unwrap().exists(), !cleanup);
+                assert_eq!(
+                    used.database
+                        .contains(Store::id(&reference).unwrap())
+                        .unwrap(),
+                    !cleanup
+                );
                 assert_eq!(used.bytes, Store::status(&directory).await.unwrap().bytes);
             }
             tokio::task::spawn_blocking(|| ()).await.unwrap();
@@ -898,7 +1106,7 @@ mod tests {
         let used = store.used.lock().await;
         for reference in [first, second] {
             assert!(
-                used.pins[&store.path(&reference).unwrap()]
+                used.pins[Store::id(&reference).unwrap()]
                     .upgrade()
                     .is_some()
             );
@@ -936,21 +1144,25 @@ mod tests {
                 .is_err()
         );
         let reference = Store::reference();
-        let temporary = store.path(&reference).unwrap().with_extension("tmp");
-        std::fs::write(&temporary, b"unfinished").unwrap();
-        store.used.lock().await.bytes += 10;
+        store.used.lock().await.database.connection.execute_batch(
+            "CREATE TEMP TRIGGER fail_access BEFORE INSERT ON access BEGIN SELECT RAISE(ABORT, 'fixture'); END;"
+        ).unwrap();
         assert!(
             store
                 .save(&reference, "m", &native, json!([]))
                 .await
                 .is_err()
         );
-        assert_eq!(std::fs::read(temporary).unwrap(), b"unfinished");
-        assert_eq!(store.used.lock().await.bytes, before.bytes + 10);
+        let used = store.used.lock().await;
         assert_eq!(
-            store.used.lock().await.bytes,
-            Store::status(&directory).await.unwrap().bytes
+            used.database
+                .load(Store::id(&reference).unwrap(), 1000)
+                .unwrap(),
+            Loaded::Missing
         );
+        assert_eq!(used.bytes, before.bytes);
+        assert_eq!(used.bytes, Store::status(&directory).await.unwrap().bytes);
+        drop(used);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1058,11 +1270,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let path = store.path(&reference).unwrap();
-        std::fs::File::open(&path)
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
+        set_last_used(&store, &reference, old).await;
         let history = json!({"messages":[{"role":"assistant","content":content}]});
         let mut invalid = history.clone();
         invalid["messages"][0]["content"][1]["text"] = json!("edited");
@@ -1072,7 +1280,10 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), old);
+        assert_eq!(
+            last_used(&store, &reference).await,
+            sqlite::timestamp(old).unwrap()
+        );
         let mut first = Vec::new();
         let mut second = Vec::new();
         store
@@ -1083,7 +1294,7 @@ mod tests {
             .restore_scoped_pinned(&history, "openai", "gpt-test", &mut second)
             .await
             .unwrap();
-        assert!(std::fs::metadata(&path).unwrap().modified().unwrap() >= now);
+        assert!(last_used(&store, &reference).await >= sqlite::timestamp(now).unwrap());
         assert!(Arc::ptr_eq(&first[0], &second[0]));
         assert_eq!(store.cleanup_at(now + day).await.unwrap().records, 0);
         drop(first);
@@ -1153,6 +1364,38 @@ mod tests {
         drop(pin);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    async fn set_last_used(store: &Store, reference: &str, time: SystemTime) {
+        store
+            .used
+            .lock()
+            .await
+            .database
+            .connection
+            .execute(
+                "UPDATE access SET last_used = ?2 WHERE id = ?1",
+                (
+                    Store::id(reference).unwrap(),
+                    sqlite::timestamp(time).unwrap(),
+                ),
+            )
+            .unwrap();
+    }
+
+    async fn last_used(store: &Store, reference: &str) -> i64 {
+        store
+            .used
+            .lock()
+            .await
+            .database
+            .connection
+            .query_row(
+                "SELECT last_used FROM access WHERE id = ?1",
+                [Store::id(reference).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn write_at(directory: &Path, name: &str, content: &[u8], modified: SystemTime) {

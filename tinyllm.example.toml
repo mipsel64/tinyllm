@@ -26,6 +26,9 @@ bind = "127.0.0.1:8080"
 # Default: XDG_STATE_HOME/tinyllm when XDG_STATE_HOME is absolute, otherwise
 # HOME/.local/state/tinyllm. Keep it across restarts to resume conversations.
 # One running gateway may use this state directory at a time.
+# Continuations use state.sqlite; credentials remain in auth/openai.json.
+# On first startup, legacy continuation JSON files are imported and removed
+# after commit. Keep a backup before upgrading if you need to downgrade.
 # state_dir = "/custom/state/tinyllm"
 
 # Maximum incoming JSON body, in bytes. Default: 8 MiB; must be positive.
@@ -35,12 +38,17 @@ max_request_bytes = 8388608
 # size, in bytes. Default: 32 MiB; must be positive. This is not a token limit.
 max_response_bytes = 33554432
 
-# Aggregate continuation storage budget, in bytes. Default: 256 MiB; must be at
-# least max_response_bytes. A full store returns an error unless the optional
+# Aggregate continuation payload budget, in bytes. Default: 256 MiB; must be at
+# least max_response_bytes. SQLite indexes, free pages and its temporary rollback
+# journal need additional disk space; status reports the database file separately.
+# Deleted pages are reused; the database is not routinely vacuumed.
+# A full store returns an error unless the optional
 # cleanup policy below can reclaim expired records. Credentials are separate.
 # Logs a warning at 80%. Inspect with tinyllm state status; stop the gateway and
 # preview tinyllm state prune --older-than-days 30 before adding --apply.
-# Deleted turns cannot resume; the age cutoff uses file modification time.
+# Deleted turns cannot resume. Access times track validated replays only when
+# cleanup is enabled. Otherwise prune uses creation or the last tracked access;
+# imported records retain their source file's modification time.
 max_state_bytes = 268435456
 
 # Optional global cap across inference endpoints, including active streams.
@@ -65,8 +73,12 @@ keep_alive_seconds = 10
 # Existing records get a full retention period when first enabled. Restarting
 # with cleanup enabled preserves that grace period; disabling resets it.
 # Active requests protect their records until their response completes or is
-# cancelled. Only expired continuation JSON files are removed, never auth or
-# temporary files. Logs report counts and bytes; full stores try cleanup too.
+# cancelled. Expired records are removed least-recently-used first; a full store
+# reclaims only enough expired, unpinned records for the pending save.
+# Last access is rounded up in five-minute windows to reduce writes; expiry can
+# be delayed by up to five minutes. Payloads are immutable; streaming events and
+# logs are never stored in SQLite. Empty cleanup sweeps do not write to it.
+# Auth and legacy temporary files are excluded from automatic cleanup.
 # Conversations idle beyond this period may no longer resume: start a new
 # conversation with a summary. Back up state if longer retention is required.
 # [server.state_cleanup]

@@ -455,6 +455,181 @@ async fn continuation_survives_restart_forks_and_explicit_compaction_boundary() 
     tokio::fs::remove_dir_all(directory).await.unwrap();
 }
 
+fn claude_fork_request() -> Value {
+    let mut req = request();
+    req["messages"] = json!([
+        {"role":"user","content":"Parent task"},
+        {"role":"assistant","content":[{"type":"tool_use","id":"fork_1","name":"Agent","input":{"subagent_type":"fork","description":"Check transport","prompt":"Check the transport."}}]},
+        {"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"fork_1","content":[{"type":"text","text":"Fork started — processing in background"}]},
+            {"type":"text","text":"<fork-boilerplate>\nYou are a worker fork. The transcript above is the parent's history — inherited reference, not your situation. You are NOT a continuation of that agent. Execute ONE directive, then stop.\n</fork-boilerplate>\n\nYour directive: Check the transport."}
+        ]}
+    ]);
+    req
+}
+
+#[tokio::test]
+async fn claude_fork_bootstrap_preserves_inherited_and_worker_reasoning() {
+    use state::Store;
+    let directory = std::env::temp_dir().join(format!("tinyllm-fork-{}", uuid::Uuid::new_v4()));
+    let store = Store::open(directory.clone(), 100_000, 50_000)
+        .await
+        .unwrap();
+    let mut req = claude_fork_request();
+    let native = upstream_response(json!([
+        {"type":"reasoning","id":"rs_parent","summary":[],"encrypted_content":"parent-reasoning"},
+        {"type":"message","id":"msg_parent","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Parent context","annotations":[]}]}
+    ]));
+    let reference = Store::reference();
+    let content = serde_json::to_value(
+        protocol::response(&native, "openai/gpt-test", &reference)
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    store
+        .save(&reference, "gpt-test", &native, content.clone())
+        .await
+        .unwrap();
+    req["messages"].as_array_mut().unwrap().splice(
+        1..1,
+        [
+            json!({"role":"assistant","content":content}),
+            json!({"role":"user","content":"Start the worker"}),
+        ],
+    );
+    let restored = store.restore(&req, "gpt-test").await.unwrap();
+    let out = protocol::request(&req, &model(), &restored).unwrap();
+    assert_eq!(out["input"][2]["encrypted_content"], "parent-reasoning");
+    assert_eq!(out["input"][3]["phase"], "commentary");
+    assert_eq!(out["input"][5]["type"], "function_call");
+    assert_eq!(out["input"][5]["call_id"], "fork_1");
+    assert_eq!(out["input"][6]["type"], "function_call_output");
+    assert_eq!(out["input"][6]["call_id"], "fork_1");
+    assert_eq!(
+        out["input"][6]["output"][0]["text"],
+        "Fork started — processing in background"
+    );
+    assert_eq!(
+        out["input"][7]["content"][0]["text"],
+        req["messages"][4]["content"][1]["text"]
+    );
+
+    let native = upstream_response(json!([
+        {"type":"reasoning","id":"rs_worker","summary":[],"encrypted_content":"worker-reasoning"},
+        {"type":"function_call","call_id":"work_1","name":"lookup","arguments":"{}"}
+    ]));
+    let reference = Store::reference();
+    let content = serde_json::to_value(
+        protocol::response(&native, "openai/gpt-test", &reference)
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    store
+        .save(&reference, "gpt-test", &native, content.clone())
+        .await
+        .unwrap();
+    req["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":content}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"work_1","content":"ok"}]}),
+    ]);
+    drop(store);
+    let store = Store::open(directory.clone(), 100_000, 50_000)
+        .await
+        .unwrap();
+    let restored = store.restore(&req, "gpt-test").await.unwrap();
+    let out = protocol::request(&req, &model(), &restored).unwrap();
+    assert_eq!(out["input"][8]["encrypted_content"], "worker-reasoning");
+    assert_eq!(out["input"][9]["call_id"], "work_1");
+    assert_eq!(out["input"][10]["call_id"], "work_1");
+    for index in [1, 5] {
+        let mut edited = req.clone();
+        edited["messages"][index]["content"][1]["text"] = json!("changed");
+        assert!(store.restore(&edited, "gpt-test").await.is_err());
+    }
+    drop(store);
+    tokio::fs::remove_dir_all(directory).await.unwrap();
+}
+
+#[tokio::test]
+async fn claude_fork_bootstrap_requires_the_complete_start_exchange() {
+    use state::Store;
+    let directory =
+        std::env::temp_dir().join(format!("tinyllm-fork-shape-{}", uuid::Uuid::new_v4()));
+    let store = Store::open(directory.clone(), 100_000, 50_000)
+        .await
+        .unwrap();
+    let req = claude_fork_request();
+    assert!(store.restore(&req, "gpt-test").await.is_ok());
+    let mut parallel = req.clone();
+    let mut call = parallel["messages"][1]["content"][0].clone();
+    call["id"] = json!("fork_2");
+    parallel["messages"][1]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(call);
+    let mut result = parallel["messages"][2]["content"][0].clone();
+    result["tool_use_id"] = json!("fork_2");
+    parallel["messages"][2]["content"]
+        .as_array_mut()
+        .unwrap()
+        .insert(1, result);
+    let restored = store.restore(&parallel, "gpt-test").await.unwrap();
+    let out = protocol::request(&parallel, &model(), &restored).unwrap();
+    assert_eq!(out["input"][3]["call_id"], "fork_2");
+    assert_eq!(out["input"][5]["call_id"], "fork_2");
+    parallel["messages"][2]["content"][1]["tool_use_id"] = json!("fork_1");
+    assert!(store.restore(&parallel, "gpt-test").await.is_err());
+    for (pointer, value) in [
+        ("/messages/1/content", json!([])),
+        ("/messages/1/content/0/name", json!("lookup")),
+        ("/messages/1/content/0/id", json!("")),
+        (
+            "/messages/1/content/0/input/subagent_type",
+            json!("general-purpose"),
+        ),
+        ("/messages/2/role", json!("system")),
+        ("/messages/2/content", json!([])),
+        ("/messages/2/content/0/tool_use_id", json!("other_call")),
+        (
+            "/messages/2/content/0/content/0/text",
+            json!("Actual tool output"),
+        ),
+        ("/messages/2/content/1/type", json!("image")),
+        (
+            "/messages/2/content/1/text",
+            json!("Continue the parent task"),
+        ),
+    ] {
+        let mut invalid = req.clone();
+        *invalid.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            store.restore(&invalid, "gpt-test").await.is_err(),
+            "{pointer}"
+        );
+    }
+    let mut invalid = req.clone();
+    invalid["messages"][2]["content"][0]["is_error"] = json!(true);
+    assert!(store.restore(&invalid, "gpt-test").await.is_err());
+    let mut invalid = req.clone();
+    invalid["messages"][2]["content"][1]["text"] = json!(
+        req["messages"][2]["content"][1]["text"]
+            .as_str()
+            .unwrap()
+            .replace("Your directive: Check the transport.", "Your directive: ")
+    );
+    assert!(store.restore(&invalid, "gpt-test").await.is_err());
+    let mut invalid = req.clone();
+    invalid["messages"][1]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"text","text":"Unreferenced model output"}));
+    assert!(store.restore(&invalid, "gpt-test").await.is_err());
+    drop(store);
+    tokio::fs::remove_dir_all(directory).await.unwrap();
+}
+
 #[test]
 fn invalid_tool_json_and_upstream_failures_never_become_success() {
     let mut r = upstream_response(

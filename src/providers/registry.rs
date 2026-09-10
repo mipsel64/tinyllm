@@ -78,7 +78,7 @@ impl Registry {
                         interval.tick().await;
                         let Some(store) = store.upgrade() else { break; };
                         if let Err(error) = store.cleanup().await {
-                            tracing::warn!(%error, "continuation cleanup failed; will retry next interval");
+                            tracing::warn!(error = %format_args!("{error:#}"), "continuation cleanup failed; will retry next interval");
                         }
                     }
                 })
@@ -135,21 +135,24 @@ mod tests {
         }))
         .unwrap();
         let registry = Registry::new(&config).await.unwrap();
-        let path = directory.join("00000000000000000000000000000001.json");
+        let connection = rusqlite::Connection::open(directory.join("state.sqlite")).unwrap();
         for _ in 0..2 {
-            std::fs::write(&path, b"expired").unwrap();
-            std::fs::File::open(&path)
-                .unwrap()
-                .set_modified(old)
-                .unwrap();
+            connection.execute_batch("BEGIN; INSERT INTO records VALUES ('fixture', x'00'); INSERT INTO access VALUES ('fixture', 1, 1); COMMIT;").unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
-                while path.exists() {
+                while connection
+                    .query_row("SELECT count(*) FROM records", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+                    != 0
+                {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
             .expect("periodic cleanup must run again after its first tick");
         }
+        drop(connection);
         let worker = registry.cleanup.as_ref().unwrap().abort_handle();
         drop(registry);
         tokio::time::timeout(Duration::from_secs(5), async {

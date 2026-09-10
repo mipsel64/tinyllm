@@ -160,12 +160,21 @@ async fn main() -> eyre::Result<()> {
 }
 
 async fn state_command(command: &StateCommand, config: &config::Server) -> eyre::Result<()> {
-    use providers::openai::state::Store;
+    use providers::openai::state::{DATABASE_FILE, Store};
     println!("State: {}", config.state_dir.display());
     match command {
         StateCommand::Status => {
             let usage = Store::status(&config.state_dir).await?;
             print_usage("Snapshot", usage, config.max_state_bytes);
+            match tokio::fs::symlink_metadata(config.state_dir.join(DATABASE_FILE)).await {
+                Ok(metadata) if metadata.is_file() => println!(
+                    "SQLite file: {} bytes, including reusable free pages (journal excluded)",
+                    metadata.len()
+                ),
+                Ok(_) => eyre::bail!("state database must be a regular file"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
             if usage.is_high(config.max_state_bytes) {
                 eprintln!(
                     "State is at least 80% full. Stop the gateway and preview tinyllm state prune before cleanup."
@@ -191,7 +200,7 @@ async fn state_command(command: &StateCommand, config: &config::Server) -> eyre:
             );
             print_usage("Remaining", report.after, config.max_state_bytes);
             if !apply {
-                println!("No files removed. Repeat with --apply to delete the selected files.");
+                println!("No records removed. Repeat with --apply to delete the selection.");
             }
         }
     }
@@ -200,7 +209,7 @@ async fn state_command(command: &StateCommand, config: &config::Server) -> eyre:
 
 fn print_usage(label: &str, usage: providers::openai::state::Usage, limit: u64) {
     println!(
-        "{label}: {} records, {} temporary files, {} / {limit} bytes",
+        "{label}: {} records, {} temporary files, {} / {limit} record bytes",
         usage.records, usage.temporary_files, usage.bytes
     );
 }
