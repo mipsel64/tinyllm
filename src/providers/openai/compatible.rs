@@ -43,11 +43,12 @@ pub async fn execute(
     let is_chat = format == ApiFormat::ChatCompletions;
     let include_usage = source["stream_options"]["include_usage"] == true;
     let mut restored = false;
+    let mut state_pins = Vec::new();
     let mut body = if is_chat {
         let history = request::history(&source)?;
         let native = provider
             .store
-            .restore_scoped(&history, &context.provider, &model.id)
+            .restore_scoped_pinned(&history, &context.provider, &model.id, &mut state_pins)
             .await?;
         restored = !native.is_empty();
         request::chat(&source, &model, subscription, &native)?
@@ -92,6 +93,9 @@ pub async fn execute(
     }
     let limit = provider.server.max_response_bytes;
     let reference = Store::reference();
+    if is_chat {
+        state_pins.extend(provider.store.pin(&reference).await?);
+    }
     let public_model = context.public_model;
     let mut tracker = stream::Native::new(subscription);
     let body = if streaming {
@@ -162,7 +166,11 @@ pub async fn execute(
             ResponseBody::Json(native)
         }
     };
-    Ok(ProviderOutput { headers, body })
+    Ok(ProviderOutput {
+        headers,
+        body,
+        state_pins,
+    })
 }
 
 fn redact(mut error: Error, key: &str) -> Error {

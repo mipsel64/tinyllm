@@ -128,6 +128,9 @@ impl Config {
             }
         }
         let s = &self.server;
+        if let Some(cleanup) = s.state_cleanup {
+            cleanup.retention()?;
+        }
         if s.max_concurrent_requests
             .is_some_and(|limit| !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&limit))
         {

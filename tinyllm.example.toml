@@ -36,8 +36,8 @@ max_request_bytes = 8388608
 max_response_bytes = 33554432
 
 # Aggregate continuation storage budget, in bytes. Default: 256 MiB; must be at
-# least max_response_bytes. Records are not automatically evicted; a full store
-# returns an error. Subscription credentials are separate from this budget.
+# least max_response_bytes. A full store returns an error unless the optional
+# cleanup policy below can reclaim expired records. Credentials are separate.
 # Logs a warning at 80%. Inspect with tinyllm state status; stop the gateway and
 # preview tinyllm state prune --older-than-days 30 before adding --apply.
 # Deleted turns cannot resume; the age cutoff uses file modification time.
@@ -59,6 +59,19 @@ timeout_seconds = 600
 # Downstream SSE keep-alive interval, in seconds. Default: 10; must be positive.
 # Emits Anthropic ping events or OpenAI SSE comments; does not extend the timeout.
 keep_alive_seconds = 10
+
+# Optional automatic cleanup; omitting this section disables it.
+# Expiry uses the last validated replay (or creation for unused records).
+# Existing records get a full retention period when first enabled. Restarting
+# with cleanup enabled preserves that grace period; disabling resets it.
+# Active requests protect their records until their response completes or is
+# cancelled. Only expired continuation JSON files are removed, never auth or
+# temporary files. Logs report counts and bytes; full stores try cleanup too.
+# Conversations idle beyond this period may no longer resume: start a new
+# conversation with a summary. Back up state if longer retention is required.
+# [server.state_cleanup]
+# idle_days = 30          # Default: 30 days; must be positive.
+# interval_seconds = 3600 # Default: hourly; must be positive. Also runs at startup.
 
 [logging]
 # tracing target filter on stderr. Default: tinyllm=info; dependencies stay quiet.

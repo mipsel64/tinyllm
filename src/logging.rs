@@ -161,6 +161,109 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn request_logs_include_method_and_path_without_secrets() {
+        use axum::{extract::Request, middleware};
+        use tracing::instrument::WithSubscriber;
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = output.clone();
+        let subscriber = tracing::Dispatch::new(
+            subscriber(
+                &Config {
+                    format: Format::Json,
+                    level: "tinyllm=debug".into(),
+                },
+                move || Capture(captured.clone()),
+            )
+            .unwrap(),
+        );
+        let config = serde_json::from_value(serde_json::json!({
+            "server":{"auth_token":"fixture-local-secret"},
+            "providers":{"fixture":{"type":"openrouter","api_key":"fixture-upstream-secret"}}
+        }))
+        .unwrap();
+        let router = crate::server::router(config)
+            .await
+            .unwrap()
+            .layer(middleware::from_fn(
+                move |request: Request, next: middleware::Next| {
+                    next.run(request).with_subscriber(subscriber.clone())
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        for (path, token, status, level, kind, message) in [
+            (
+                "/unknown/endpoint",
+                "fixture-local-secret",
+                404,
+                "WARN",
+                "not_found_error",
+                "endpoint not implemented",
+            ),
+            (
+                "/anthropic/v1/messages/count_tokens",
+                "fixture-local-secret",
+                404,
+                "DEBUG",
+                "not_found_error",
+                "token counting is not supported",
+            ),
+            (
+                "/anthropic/v1/messages/count_tokens/unknown",
+                "fixture-local-secret",
+                404,
+                "WARN",
+                "not_found_error",
+                "endpoint not implemented",
+            ),
+            (
+                "/anthropic/v1/messages/count_tokens",
+                "invalid-fixture-secret",
+                401,
+                "WARN",
+                "authentication_error",
+                "invalid local gateway token",
+            ),
+        ] {
+            output.lock().unwrap().clear();
+            let response = client
+                .post(format!(
+                    "http://{address}{path}?beta=true&token=fixture-query-secret"
+                ))
+                .bearer_auth(token)
+                .body("fixture-prompt-secret")
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let body: serde_json::Value = response.json().await.unwrap();
+            let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert!(!text.contains("secret"));
+            let events = text
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(events.len(), 2, "{path}");
+            assert_eq!(events[0]["level"], level, "{path}");
+            assert_eq!(events[1]["fields"]["message"], "response headers ready");
+            assert_eq!(body["error"]["type"], kind);
+            assert!(body["error"]["message"].as_str().unwrap().contains(message));
+            assert!(body.get("input_tokens").is_none());
+            for event in &events {
+                assert_eq!(event["span"]["method"], "POST");
+                assert_eq!(event["span"]["path"], path);
+                assert_eq!(event["span"]["request_id"], events[0]["span"]["request_id"]);
+                uuid::Uuid::parse_str(event["span"]["request_id"].as_str().unwrap()).unwrap();
+            }
+        }
+        task.abort();
+    }
+
     #[test]
     fn unknown_field_diagnostics_are_bounded_and_omit_values() {
         let output = Arc::new(Mutex::new(Vec::new()));
