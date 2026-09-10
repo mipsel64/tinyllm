@@ -212,7 +212,7 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
         .iter()
         .map(|event| {
             format!(
-                "event: {}\ndata: {event}\n\n",
+                "data: {{\"type\":\"ping\"}}\n\nevent: {}\ndata: {event}\n\nevent: keepalive\ndata: {{\"type\":\"keepalive\"}}\n\n",
                 event["type"].as_str().unwrap()
             )
         })
@@ -315,9 +315,15 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
                     let mut terminal = false;
                     while let Some(event) = events.next().await {
                         match event.unwrap() {
-                            ApiEvent::Responses(value) if value["type"] == "response.completed" => {
-                                assert_eq!(value["response"]["output"][0], reasoning);
-                                terminal = true;
+                            ApiEvent::Responses(value) => {
+                                assert!(!matches!(
+                                    value["type"].as_str(),
+                                    Some("ping" | "keepalive")
+                                ));
+                                if value["type"] == "response.completed" {
+                                    assert_eq!(value["response"]["output"][0], reasoning);
+                                    terminal = true;
+                                }
                             }
                             ApiEvent::ChatCompletions(value)
                                 if !value["choices"][0]["finish_reason"].is_null() =>
