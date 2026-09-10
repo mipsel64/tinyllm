@@ -168,6 +168,8 @@ mod tests {
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let captured = output.clone();
+        // Keep untraced requests from caching a disabled span for the scoped subscriber.
+        let _untraced = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let subscriber = tracing::Dispatch::new(
             subscriber(
                 &Config {
@@ -188,13 +190,31 @@ mod tests {
             .unwrap()
             .layer(middleware::from_fn(
                 move |request: Request, next: middleware::Next| {
-                    next.run(request).with_subscriber(subscriber.clone())
+                    let subscriber = subscriber.clone();
+                    async move {
+                        if request.headers().contains_key("x-test-untraced") {
+                            next.run(request).await
+                        } else {
+                            next.run(request).with_subscriber(subscriber).await
+                        }
+                    }
                 },
             ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
+        client
+            .post(format!("http://{address}/unknown/endpoint"))
+            .bearer_auth("fixture-local-secret")
+            .header("x-test-untraced", "true")
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
         for (path, token, status, level, kind, message) in [
             (
                 "/unknown/endpoint",
