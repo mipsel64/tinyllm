@@ -139,7 +139,7 @@ fn ordered_history_images_tool_errors_and_choices() {
 fn rejects_meaningful_unsupported_content_and_orphan_results() {
     for change in [
         json!({"top_k":3}),
-        json!({"stop_sequences":["STOP"]}),
+        json!({"stop_sequences":[""]}),
         json!({"context_management":{"edits":[{}]}}),
     ] {
         let mut req = request();
@@ -224,6 +224,159 @@ fn deferred_tools_load_from_references_without_losing_result_content() {
 
 fn upstream_response(output: Value) -> Value {
     json!({"id":"resp_test","status":"completed","output":output,"usage":{"input_tokens":120,"output_tokens":25,"input_tokens_details":{"cached_tokens":20},"output_tokens_details":{"reasoning_tokens":15}}})
+}
+
+#[tokio::test]
+async fn tool_default_replay_uses_the_original_schema_after_restart() {
+    use axum::{Json, Router, routing::post};
+    let native = upstream_response(json!([
+        {"type":"reasoning","id":"rs","summary":[],"encrypted_content":"opaque"},
+        {"type":"function_call","id":"fc","call_id":"edit_1","name":"Edit","arguments":"{\"file_path\":\"/tmp/example\",\"old_string\":\"OLD\",\"new_string\":\"NEW\"}"}
+    ]));
+    let response = native.clone();
+    let (upstream, upstream_task) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let response = response.clone();
+            async move { Json(response) }
+        }),
+    ))
+    .await;
+    let directory = std::env::temp_dir().join(format!("tinyllm-defaults-{}", uuid::Uuid::new_v4()));
+    let (gateway, task) = serve(
+        crate::server::router(config(upstream, directory.clone()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let mut req = request();
+    req["tools"] = json!([{"name":"Edit","input_schema":{"type":"object","properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean","default":false}},"required":["file_path","old_string","new_string"]}}]);
+    let response: Value = reqwest::Client::new()
+        .post(format!("{gateway}/anthropic/v1/messages"))
+        .bearer_auth("local-secret")
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    task.abort();
+    let _ = task.await;
+    upstream_task.abort();
+    let store = state::Store::open(directory.clone(), 100_000, 50_000)
+        .await
+        .unwrap();
+    let original = response["content"].clone();
+    for input in [original[1]["input"].clone(), {
+        let mut input = original[1]["input"].clone();
+        input["replace_all"] = json!(false);
+        input
+    }] {
+        req["messages"] = json!([{"role":"assistant","content":original}]);
+        req["messages"][0]["content"][1]["input"] = input;
+        req["tools"] = json!([]);
+        let restored = store
+            .restore_scoped(&req, "openai", "gpt-test")
+            .await
+            .unwrap();
+        assert_eq!(json!(restored[&0]), native["output"]);
+    }
+    let valid = req.clone();
+    for (pointer, value) in [
+        ("/messages/0/content/1/input/replace_all", json!(true)),
+        (
+            "/messages/0/content/1/input/file_path",
+            json!("/tmp/changed"),
+        ),
+        ("/messages/0/content/1/id", json!("changed")),
+        ("/messages/0/content/1/name", json!("Other")),
+        ("/messages/0/content/1", json!(42)),
+        ("/messages/0/content/1", json!([])),
+        ("/messages/0/content/1", json!("invalid")),
+    ] {
+        let mut changed = valid.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        changed["tools"] =
+            json!([{"name":"Edit","input_schema":{"properties":{"replace_all":{"default":true}}}}]);
+        assert!(
+            store
+                .restore_scoped(&changed, "openai", "gpt-test")
+                .await
+                .is_err(),
+            "{pointer}"
+        );
+    }
+    let mut changed = valid;
+    changed["messages"][0]["content"][1]["input"]["unknown"] = json!(false);
+    assert!(
+        store
+            .restore_scoped(&changed, "openai", "gpt-test")
+            .await
+            .is_err()
+    );
+    drop(store);
+    tokio::fs::remove_dir_all(directory).await.unwrap();
+}
+
+#[tokio::test]
+async fn classifier_stop_sequence_returns_only_visible_output() {
+    use axum::{Json, Router, routing::post};
+    let (upstream, up_task) = serve(Router::new().route("/responses", post(|Json(req): Json<Value>| async move {
+        assert!(req.get("stop_sequences").is_none());
+        assert!(req.get("stop").is_none());
+        Json(upstream_response(json!([
+            {"type":"reasoning","id":"rs_before","summary":[],"encrypted_content":"opaque-before"},
+            {"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"<block>false</block>hidden","annotations":[]}]},
+            {"type":"reasoning","id":"rs_after","summary":[],"encrypted_content":"opaque-after"},
+            {"type":"function_call","id":"f","call_id":"hidden_call","name":"lookup","arguments":"{}"}
+        ])))
+    }))).await;
+    let directory = std::env::temp_dir().join(format!("tinyllm-stop-{}", uuid::Uuid::new_v4()));
+    let (gateway, task) = serve(
+        crate::server::router(config(upstream, directory.clone()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let req = json!({"model":"openai/gpt-test","messages":[{"role":"user","content":"Classify this action"}],"max_tokens":2112,"stop_sequences":["</block>"]});
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/anthropic/v1/messages?beta=true"))
+        .bearer_auth("local-secret")
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let response: Value = response.json().await.unwrap();
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["stop_reason"], "stop_sequence");
+    assert_eq!(response["stop_sequence"], "</block>");
+    assert_eq!(response["content"].as_array().unwrap().len(), 2);
+    assert_eq!(response["content"][1]["text"], "<block>false");
+    assert_eq!(response["usage"]["output_tokens"], 25);
+    task.abort();
+    let _ = task.await;
+    up_task.abort();
+    let store = state::Store::open(directory.clone(), 100_000, 50_000)
+        .await
+        .unwrap();
+    let restored = store
+        .restore_scoped(
+            &json!({"messages":[{"role":"assistant","content":response["content"]}]}),
+            "openai",
+            "gpt-test",
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored[&0].len(), 2);
+    assert_eq!(restored[&0][0]["encrypted_content"], "opaque-before");
+    assert_eq!(restored[&0][1]["content"][0]["text"], "<block>false");
+    assert!(restored[&0][1].get("id").is_none());
+    drop(store);
+    tokio::fs::remove_dir_all(directory).await.unwrap();
 }
 
 #[tokio::test]
@@ -582,6 +735,49 @@ async fn http_protocol_preserves_json_streams_and_unique_continuations() {
 }
 
 #[tokio::test]
+async fn streamed_stop_sequence_suppresses_later_tool_calls() {
+    let fixture = http_fixture("openai", Some("local-secret")).await;
+    let mut req = request();
+    req["stream"] = json!(true);
+    req["stop_sequences"] = json!(["éll"]);
+    let response = fixture
+        .client
+        .post(&fixture.url)
+        .bearer_auth("local-secret")
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["x-tinyllm-stop-sequences"],
+        "local; usage-includes-discarded-output"
+    );
+    let body = response.text().await.unwrap();
+    let events: Vec<Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let text: String = events
+        .iter()
+        .filter_map(|e| e["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, "h");
+    assert!(!body.contains("tool_use"), "{body}");
+    assert!(!body.contains("event: error"), "{body}");
+    assert_eq!(events.last().unwrap()["type"], "message_stop");
+    let delta = events
+        .iter()
+        .find(|e| e["type"] == "message_delta")
+        .unwrap();
+    assert_eq!(delta["delta"]["stop_sequence"], "éll");
+    assert_eq!(delta["delta"]["stop_reason"], "stop_sequence");
+    assert_eq!(delta["usage"]["output_tokens"], 25);
+    fixture.close().await;
+}
+
+#[tokio::test]
 async fn http_concurrency_is_uncapped_by_default() {
     let fixture = http_fixture("openai", Some("local-secret")).await;
     let mut concurrent = request();
@@ -737,8 +933,8 @@ async fn disconnect_cancels_upstream_for_stream_and_json() {
             async move {
                 let stream = async_stream::stream! {
                     let _guard=guard;
-                    let first = if streaming {"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n"} else {"{\"id\":"};
-                    yield Ok::<_,std::io::Error>(bytes::Bytes::from_static(first.as_bytes()));
+                    let first = if streaming {stream_fixture()[..5].iter().map(|event|format!("event: {}\ndata: {event}\n\n",event["type"].as_str().unwrap())).collect::<String>()} else {"{\"id\":".into()};
+                    yield Ok::<_,std::io::Error>(bytes::Bytes::from(first));
                     loop {tokio::time::sleep(std::time::Duration::from_millis(50)).await; yield Ok(bytes::Bytes::from_static(b" "));}
                 };
                 ([("content-type",if streaming {"text/event-stream"} else {"application/json"})],Body::from_stream(stream))
@@ -750,6 +946,7 @@ async fn disconnect_cancels_upstream_for_stream_and_json() {
         let (gateway, gw_task) = serve(crate::server::router(cfg).await.unwrap()).await;
         let mut req = request();
         req["stream"] = json!(streaming);
+        req["stop_sequences"] = json!(["éll"]);
         let url = format!("{gateway}/anthropic/v1/messages");
         let call = tokio::spawn(async move {
             let response = reqwest::Client::new()
@@ -760,9 +957,14 @@ async fn disconnect_cancels_upstream_for_stream_and_json() {
                 .await
                 .unwrap();
             if streaming {
-                let mut body = response.bytes_stream();
-                assert!(body.next().await.is_some());
-                drop(body);
+                let events = stream::decode(response.bytes_stream(), 10_000);
+                futures::pin_mut!(events);
+                loop {
+                    let event = events.next().await.unwrap().unwrap();
+                    if event["type"] == "content_block_stop" && event["index"] == 1 {
+                        break;
+                    }
+                }
             } else {
                 response.text().await.unwrap();
             }
@@ -1540,7 +1742,8 @@ async fn live_sse_is_incremental_keeps_alive_and_never_finishes_failed_streams()
     use futures::StreamExt;
     let (upstream,up_task)=serve(Router::new().route("/responses",post(|Json(req):Json<Value>| async move {
         let output=async_stream::stream! {
-            yield Ok::<_,std::io::Error>(bytes::Bytes::from_static(b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n"));
+            let first = stream_fixture()[..5].iter().map(|event|format!("event: {}\ndata: {event}\n\n",event["type"].as_str().unwrap())).collect::<String>();
+            yield Ok::<_,std::io::Error>(bytes::Bytes::from(first));
             tokio::time::sleep(std::time::Duration::from_millis(1150)).await;
             if req["max_output_tokens"] == 13 {
                 yield Ok(bytes::Bytes::from_static(b"event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"backend failed upstream-secret\"}\n\n"));
@@ -1554,10 +1757,13 @@ async fn live_sse_is_incremental_keeps_alive_and_never_finishes_failed_streams()
     let (gateway, gw_task) = serve(crate::server::router(cfg).await.unwrap()).await;
     let client = reqwest::Client::new();
     let url = format!("{gateway}/anthropic/v1/messages");
-    for max in [13, 14] {
+    for (max, stops) in [(13, false), (14, false), (13, true), (14, true)] {
         let mut req = request();
         req["stream"] = json!(true);
         req["max_tokens"] = json!(max);
+        if stops {
+            req["stop_sequences"] = json!(["éll"]);
+        }
         let response = client
             .post(&url)
             .bearer_auth("local-secret")
@@ -1581,20 +1787,37 @@ async fn live_sse_is_incremental_keeps_alive_and_never_finishes_failed_streams()
             .await
             .unwrap();
         assert_eq!(overloaded.status(), 503);
-        let mut text = String::from_utf8(first.to_vec()).unwrap();
+        let mut bytes = first.to_vec();
         while let Some(chunk) = body.next().await {
-            text.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+            bytes.extend_from_slice(&chunk.unwrap());
         }
+        let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("event: ping"));
         assert!(text.contains("event: error"));
         assert!(!text.contains("message_stop"));
         assert!(!text.contains("upstream-secret"));
+        if stops {
+            let deltas: String = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter_map(|event| event["delta"]["text"].as_str().map(str::to_owned))
+                .collect();
+            assert_eq!(deltas, "h");
+        }
         assert!(text.contains(if max == 13 {
             "backend failed [redacted]"
         } else {
             "ended before completion"
         }));
     }
+    assert!(!std::fs::read_dir(&directory).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "json")
+    }));
     gw_task.abort();
     up_task.abort();
     tokio::fs::remove_dir_all(directory).await.unwrap();

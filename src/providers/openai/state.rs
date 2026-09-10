@@ -49,6 +49,37 @@ struct Record {
     model: String,
     output: Vec<Value>,
     content: Vec<Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    tool_defaults: BTreeMap<String, BTreeMap<String, Value>>,
+}
+
+pub(super) fn tool_defaults(tools: &Value) -> BTreeMap<String, BTreeMap<String, Value>> {
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let name = tool["name"].as_str()?;
+            let schema = &tool["input_schema"];
+            let required: HashSet<_> = schema["required"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let defaults: BTreeMap<_, _> = schema["properties"]
+                .as_object()?
+                .iter()
+                .filter_map(|(name, property)| {
+                    if required.contains(name.as_str()) {
+                        return None;
+                    }
+                    Some((name.clone(), property.get("default")?.clone()))
+                })
+                .collect();
+            (!defaults.is_empty()).then(|| (name.to_owned(), defaults))
+        })
+        .collect()
 }
 
 pub struct Store {
@@ -125,16 +156,41 @@ impl Store {
         response: &Value,
         content: Value,
     ) -> Result<()> {
+        self.save_with_defaults(reference, model, response, content, &BTreeMap::new())
+            .await
+    }
+
+    async fn save_with_defaults(
+        &self,
+        reference: &str,
+        model: &str,
+        response: &Value,
+        content: Value,
+        defaults: &BTreeMap<String, BTreeMap<String, Value>>,
+    ) -> Result<()> {
+        let content = content
+            .as_array()
+            .ok_or_else(|| Error::upstream("invalid response content"))?
+            .clone();
+        let mut tool_defaults = BTreeMap::new();
+        for block in &content {
+            if block["type"] == "tool_use"
+                && let Some(name) = block["name"].as_str()
+                && let Some(properties) = defaults.get(name)
+            {
+                tool_defaults
+                    .entry(name.to_owned())
+                    .or_insert_with(|| properties.clone());
+            }
+        }
         let record = Record {
             model: model.into(),
             output: response["output"]
                 .as_array()
                 .ok_or_else(|| Error::upstream("missing native output"))?
                 .clone(),
-            content: content
-                .as_array()
-                .ok_or_else(|| Error::upstream("invalid response content"))?
-                .clone(),
+            content,
+            tool_defaults,
         };
         let data = serde_json::to_vec(&record)
             .map_err(|_| Error::upstream("cannot serialize continuation"))?;
@@ -195,9 +251,16 @@ impl Store {
         model: &str,
         response: &Value,
         content: Value,
+        defaults: &BTreeMap<String, BTreeMap<String, Value>>,
     ) -> Result<()> {
-        self.save(reference, &format!("{provider}/{model}"), response, content)
-            .await
+        self.save_with_defaults(
+            reference,
+            &format!("{provider}/{model}"),
+            response,
+            content,
+            defaults,
+        )
+        .await
     }
 
     pub async fn restore_scoped(
@@ -317,6 +380,20 @@ impl Store {
                     return Err(Error::invalid(
                         "continuation model changed; keep its model mapping or start a new conversation",
                     ));
+                }
+                // Claude Code materializes omitted tool defaults before replaying calls.
+                for (saved, replayed) in record.content.iter().zip(&mut content[start..end]) {
+                    if saved["type"] == "tool_use"
+                        && let Some(name) = saved["name"].as_str()
+                        && let Some(defaults) = record.tool_defaults.get(name)
+                        && let Some(original) = saved["input"].as_object()
+                        && let Some(input) =
+                            replayed.get_mut("input").and_then(Value::as_object_mut)
+                    {
+                        input.retain(|key, value| {
+                            original.contains_key(key) || defaults.get(key) != Some(value)
+                        });
+                    }
                 }
                 if record.content != content[start..end] {
                     return Err(Error::invalid(
@@ -821,7 +898,14 @@ mod tests {
             json!([{"type":"redacted_thinking","data":reference},{"type":"text","text":"same"}]);
         let native = json!({"output":[{"type":"reasoning","encrypted_content":"opaque"}]});
         store
-            .save_scoped(&reference, "openai", "gpt-test", &native, content.clone())
+            .save_scoped(
+                &reference,
+                "openai",
+                "gpt-test",
+                &native,
+                content.clone(),
+                &BTreeMap::new(),
+            )
             .await
             .unwrap();
         let request = json!({"messages":[{"role":"assistant","content":content}]});
@@ -877,6 +961,36 @@ mod tests {
                 .message
                 .contains("state is missing")
         );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_calls_do_not_multiply_default_storage() {
+        let directory =
+            std::env::temp_dir().join(format!("tinyllm-default-size-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(directory.clone(), 100_000, 40_000)
+            .await
+            .unwrap();
+        let reference = Store::reference();
+        let mut content = vec![json!({"type":"redacted_thinking","data":reference})];
+        content.extend((0..100).map(
+            |id| json!({"type":"tool_use","id":format!("call_{id}"),"name":"tool","input":{}}),
+        ));
+        let defaults = tool_defaults(
+            &json!([{"name":"tool","input_schema":{"properties":{"omitted":{"default":"x".repeat(1024)}}}}]),
+        );
+        store
+            .save_scoped(
+                &reference,
+                "openai",
+                "gpt-test",
+                &json!({"output":[]}),
+                json!(content),
+                &defaults,
+            )
+            .await
+            .unwrap();
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }

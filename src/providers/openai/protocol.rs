@@ -78,12 +78,9 @@ pub fn request(
         .as_u64()
         .filter(|n| *n > 0)
         .ok_or_else(|| Error::invalid("max_tokens must be positive"))?;
-    if !req["top_k"].is_null()
-        || (!req["stop_sequences"].is_null() && req["stop_sequences"] != json!([]))
-    {
-        return Err(Error::invalid(
-            "top_k and nonempty stop_sequences are unsupported by Responses",
-        ));
+    super::stop::StopFilter::new(&req["stop_sequences"])?;
+    if !req["top_k"].is_null() {
+        return Err(Error::invalid("top_k is unsupported by Responses"));
     }
     if let Some(context) = req.get("context_management").filter(|v| !v.is_null()) {
         fields(context, &["edits"])?;

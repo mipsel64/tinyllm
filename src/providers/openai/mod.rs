@@ -3,6 +3,7 @@ mod compatible;
 pub mod models;
 pub mod protocol;
 pub mod state;
+mod stop;
 pub mod stream;
 
 use self::{
@@ -157,6 +158,8 @@ impl OpenAiProvider {
         };
         let subscription = self.config.auth.is_subscription();
         let streaming = req["stream"] == true;
+        let mut stops = stop::StopFilter::new(&req["stop_sequences"])?;
+        let defaults = state::tool_defaults(&req["tools"]);
         let mut upstream_request = protocol::request(&req, &model, &restored)?;
         if subscription {
             upstream_request = protocol::subscription_request(&req, upstream_request)?;
@@ -172,6 +175,12 @@ impl OpenAiProvider {
             "x-tinyllm-continuation",
             HeaderValue::from_static(continuation),
         );
+        if stops.enabled() {
+            headers.insert(
+                "x-tinyllm-stop-sequences",
+                HeaderValue::from_static("local; usage-includes-discarded-output"),
+            );
+        }
         headers.insert("x-tinyllm-compatibility",HeaderValue::from_static(if subscription {
             "anthropic-cache-hints-ignored; openai-automatic-caching; reasoning-reference-v1; subscription-max-tokens-unenforced"
         } else { "anthropic-cache-hints-ignored; openai-automatic-caching; reasoning-reference-v1" }));
@@ -196,12 +205,16 @@ impl OpenAiProvider {
                 loop {
                     let event = decoded.next().await.ok_or_else(|| Error::upstream("upstream stream ended before completion"))??;
                     let events = translator.accept(&event).map_err(|mut e| {e.message=e.message.replace(&key,"[redacted]");e})?;
-                    for event in events {
+                    for event in events.into_iter().flat_map(|event| stops.push(event)) {
                         yield ApiEvent::Anthropic(serde_json::to_value(event).map_err(|_| Error::upstream("cannot encode stream event"))?);
                     }
-                    if let Some(native) = translator.completed.take() {
-                        let response = protocol::response(&native,&alias,&reference).map_err(|mut e| {e.message=e.message.replace(&key,"[redacted]");e})?;
-                        store.save_scoped(&reference,&context.provider,&model.id,&native,serde_json::to_value(&response.content).map_err(|_| Error::upstream("cannot encode response content"))?).await?;
+                    if let Some(mut native) = translator.completed.take() {
+                        let mut response = protocol::response(&native,&alias,&reference).map_err(|mut e| {e.message=e.message.replace(&key,"[redacted]");e})?;
+                        for event in stops.finish() {
+                            yield ApiEvent::Anthropic(serde_json::to_value(event).map_err(|_| Error::upstream("cannot encode stream event"))?);
+                        }
+                        stops.apply(&mut native, &mut response)?;
+                        store.save_scoped(&reference,&context.provider,&model.id,&native,serde_json::to_value(&response.content).map_err(|_| Error::upstream("cannot encode response content"))?,&defaults).await?;
                         tracing::info!(output_tokens=response.usage.output_tokens,"stream completed");
                         for event in stream::finish(&response) { yield ApiEvent::Anthropic(serde_json::to_value(event).map_err(|_| Error::upstream("cannot encode stream event"))?); }
                         break;
@@ -210,7 +223,7 @@ impl OpenAiProvider {
             };
             ResponseBody::Stream(Box::pin(events))
         } else {
-            let native: Value = if subscription {
+            let mut native: Value = if subscription {
                 let decoded =
                     stream::decode(upstream.bytes_stream(), self.server.max_response_bytes);
                 futures::pin_mut!(decoded);
@@ -231,10 +244,13 @@ impl OpenAiProvider {
                 serde_json::from_slice(&data)
                     .map_err(|_| Error::upstream("OpenAI returned invalid JSON"))?
             };
-            let response = protocol::response(&native, &alias, &reference).map_err(|mut e| {
-                e.message = e.message.replace(&key, "[redacted]");
-                e
-            })?;
+            let mut response =
+                protocol::response(&native, &alias, &reference).map_err(|mut e| {
+                    e.message = e.message.replace(&key, "[redacted]");
+                    e
+                })?;
+            stops.json(&response);
+            stops.apply(&mut native, &mut response)?;
             self.store
                 .save_scoped(
                     &reference,
@@ -243,6 +259,7 @@ impl OpenAiProvider {
                     &native,
                     serde_json::to_value(&response.content)
                         .map_err(|_| Error::upstream("cannot encode response content"))?,
+                    &defaults,
                 )
                 .await?;
             ResponseBody::Json(
