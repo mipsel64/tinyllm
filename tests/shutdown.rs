@@ -23,7 +23,7 @@ fn service_signals_shut_down_cleanly() {
         let directory = std::env::temp_dir().join(format!("tinyllm-stop-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let config = directory.join("config.toml");
-        std::fs::write(&config, "[server]\nbind='127.0.0.1:0'\nstate_dir='state'\n[providers.fixture]\ntype='openrouter'\napi_key='fixture-key'\nbase_url='http://127.0.0.1:9'\n").unwrap();
+        std::fs::write(&config, "[server]\nbind='127.0.0.1:0'\nstate_dir='state'\n[server.state_cleanup]\ninterval_seconds=1\n[providers.fixture]\ntype='openai'\nbase_url='http://127.0.0.1:9'\n[providers.fixture.auth]\ntype='ApiKey'\noptions='fixture-key'\n").unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_tinyllm"))
             .arg("--config")
             .arg(&config)

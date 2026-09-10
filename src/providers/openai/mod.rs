@@ -147,9 +147,10 @@ impl OpenAiProvider {
 
     async fn anthropic(&self, req: Value, context: RequestContext) -> Result<ProviderOutput> {
         let model = self.model(&context.model);
+        let mut state_pins = Vec::new();
         let restored = self
             .store
-            .restore_scoped(&req, &context.provider, &model.id)
+            .restore_scoped_pinned(&req, &context.provider, &model.id, &mut state_pins)
             .await?;
         let continuation = if restored.is_empty() {
             "fresh"
@@ -194,6 +195,7 @@ impl OpenAiProvider {
             return Err(Error::upstream("OpenAI did not return text/event-stream"));
         }
         let reference = Store::reference();
+        state_pins.extend(self.store.pin(&reference).await?);
         let alias = context.public_model;
         let mut translator = stream::Translator::new(alias.clone(), reference.clone());
         translator.sparse_completion = subscription;
@@ -267,7 +269,11 @@ impl OpenAiProvider {
                     .map_err(|_| Error::upstream("cannot encode response"))?,
             )
         };
-        Ok(ProviderOutput { headers, body })
+        Ok(ProviderOutput {
+            headers,
+            body,
+            state_pins,
+        })
     }
 }
 

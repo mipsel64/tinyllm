@@ -193,7 +193,11 @@ pub(crate) async fn forward(
         public_model(&mut value, &context.public_model);
         ResponseBody::Json(value)
     };
-    Ok(ProviderOutput { headers, body })
+    Ok(ProviderOutput {
+        headers,
+        body,
+        state_pins: Vec::new(),
+    })
 }
 
 fn contains_reference(value: &Value) -> bool {

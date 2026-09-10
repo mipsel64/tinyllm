@@ -154,7 +154,7 @@ async fn run(app: Arc<AppState>, request: Request, format: ApiFormat) -> crate::
                 .into_response()
         }
     };
-    Ok(response)
+    Ok(retain_state(response, result.state_pins))
 }
 
 fn serialize(event: ApiEvent) -> Bytes {
@@ -165,5 +165,86 @@ fn serialize(event: ApiEvent) -> Bytes {
         )),
         ApiEvent::ChatCompletions(value) => Bytes::from(format!("data: {value}\n\n")),
         ApiEvent::Done => Bytes::from_static(b"data: [DONE]\n\n"),
+    }
+}
+
+fn retain_state(response: Response, pins: Vec<Arc<()>>) -> Response {
+    if pins.is_empty() {
+        return response;
+    }
+    response.map(|body| {
+        Body::from_stream(async_stream::stream! {
+            let _pins = pins;
+            let mut stream = body.into_data_stream();
+            while let Some(chunk) = stream.next().await {
+                yield chunk;
+            }
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn response_bodies_hold_state_until_completion_or_drop() {
+        for streaming in [false, true] {
+            for chunks in [0, 1, usize::MAX] {
+                let pin = Arc::new(());
+                let weak = Arc::downgrade(&pin);
+                let mut response = if streaming {
+                    (
+                        [("content-type", "text/event-stream")],
+                        Body::from_stream(futures::stream::iter([
+                            Ok::<_, Infallible>(Bytes::from_static(b"data: first\n\n")),
+                            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                        ])),
+                    )
+                        .into_response()
+                } else {
+                    Json(json!({"message":"fixture"})).into_response()
+                };
+                *response.status_mut() = StatusCode::CREATED;
+                let response = retain_state(response, vec![pin]);
+                assert!(weak.upgrade().is_some(), "unpolled body must retain state");
+                assert_eq!(response.status(), StatusCode::CREATED);
+                assert_eq!(
+                    response.headers()["content-type"],
+                    if streaming {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    }
+                );
+                let mut body = response.into_body().into_data_stream();
+                if chunks == usize::MAX {
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = body.next().await {
+                        bytes.extend_from_slice(&chunk.unwrap());
+                    }
+                    assert_eq!(
+                        bytes,
+                        if streaming {
+                            b"data: first\n\ndata: [DONE]\n\n".as_slice()
+                        } else {
+                            br#"{"message":"fixture"}"#.as_slice()
+                        }
+                    );
+                    assert!(
+                        weak.upgrade().is_none(),
+                        "completed body must release state"
+                    );
+                } else if chunks == 1 {
+                    assert!(body.next().await.unwrap().is_ok());
+                    assert!(
+                        weak.upgrade().is_some(),
+                        "unfinished body must retain state"
+                    );
+                }
+                drop(body);
+                assert!(weak.upgrade().is_none(), "dropped body must release state");
+            }
+        }
     }
 }
