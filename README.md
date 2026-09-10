@@ -87,6 +87,7 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL=openai/gpt-5.6-sol
 export ANTHROPIC_DEFAULT_SONNET_MODEL=openai/gpt-5.6-sol
 export ANTHROPIC_DEFAULT_HAIKU_MODEL=openai/gpt-5.6-sol
 export CLAUDE_CODE_SUBAGENT_MODEL=openai/gpt-5.6-sol
+export CLAUDE_CODE_DISABLE_ARTIFACT=1
 claude
 ```
 
@@ -94,6 +95,11 @@ Use your `server.auth_token` if configured; otherwise `tinyllm` is a client
 placeholder. Choose models your account can access. The prefix is the provider
 table name; the rest is the upstream model ID, including any further slashes.
 Client reasoning effort and service tier override configured model defaults.
+
+Set `CLAUDE_CODE_DISABLE_ARTIFACT=1` to prevent Claude Code from calling its hosted
+Artifact tool: gateway-token sessions cannot publish to Claude.ai Artifacts.
+Ask Claude Code to save HTML locally and open it in your browser instead; disabling
+Artifact does not automatically open local files.
 
 ToolSearch is supported; `ENABLE_TOOL_SEARCH=false` loads all MCP definitions
 upfront and uses more context. Experimental betas need no blanket disabling.
