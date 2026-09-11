@@ -106,6 +106,12 @@ carry Codex's routing hint. The suffix does not stack, and upstream decides what
 delivers: responses may still report `default`. Fast/priority processing can consume
 more credits or cost more.
 
+In auto permission mode Claude Code checks every tool call with a short
+subrequest, which by default runs on the session's model — so a reasoning model
+is asked to judge each Bash command before it runs. Set
+`server.auto_review_model` to a small fast model to make those checks quicker
+and cheaper.
+
 Set `CLAUDE_CODE_DISABLE_ARTIFACT=1` to prevent Claude Code from calling its hosted
 Artifact tool: gateway-token sessions cannot publish to Claude.ai Artifacts.
 Ask Claude Code to save HTML locally and open it in your browser instead; disabling

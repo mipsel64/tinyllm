@@ -86,7 +86,18 @@ async fn run(app: Arc<AppState>, request: Request, format: ApiFormat) -> crate::
         message: "invalid JSON request or max_request_bytes exceeded".into(),
         headers: Box::default(),
     })?;
-    let request = ApiRequest::parse(format, value)?;
+    let mut request = ApiRequest::parse(format, value)?;
+    if format == ApiFormat::Anthropic
+        && let Some(reviewer) = app.config.server.auto_review_model.as_deref()
+        && request.body.is_auto_review()
+    {
+        tracing::debug!(
+            requested = %request.body.model,
+            reviewer,
+            "routing permission classifier to the auto-review model"
+        );
+        request.body.model = reviewer.to_owned();
+    }
     let (provider, model) = app.providers.resolve(&request.body.model)?;
     let context = RequestContext {
         request_id,

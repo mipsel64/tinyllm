@@ -128,6 +128,17 @@ impl Config {
             }
         }
         let s = &self.server;
+        if let Some(reviewer) = &s.auto_review_model {
+            // Resolved on every classifier subrequest, so a bad value here would
+            // break each one at dispatch time instead of at startup.
+            let (prefix, model) = reviewer
+                .split_once('/')
+                .ok_or_else(|| eyre::eyre!("auto_review_model must be provider/native-model-id"))?;
+            validate_model(model)?;
+            if !self.providers.contains_key(prefix) {
+                bail!("auto_review_model names provider {prefix:?}, which is not configured");
+            }
+        }
         for name in [
             s.obsolete_max_state_bytes
                 .as_ref()

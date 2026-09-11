@@ -55,6 +55,9 @@ pub struct Server {
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub max_concurrent_requests: Option<usize>,
+    /// Routes Claude Code's permission-classifier subrequests to this
+    /// provider/model. Unset leaves them on the session's model.
+    pub auto_review_model: Option<String>,
     pub request_body_timeout_seconds: u64,
     pub timeout_seconds: u64,
     pub keep_alive_seconds: u64,
@@ -75,6 +78,7 @@ impl Default for Server {
             max_request_bytes: 8 * 1024 * 1024,
             max_response_bytes: 32 * 1024 * 1024,
             max_concurrent_requests: None,
+            auto_review_model: None,
             request_body_timeout_seconds: 30,
             timeout_seconds: 600,
             keep_alive_seconds: 10,
