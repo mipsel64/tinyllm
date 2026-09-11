@@ -162,6 +162,12 @@ impl OpenAiProvider {
         let mut stops = stop::StopFilter::new(&req["stop_sequences"])?;
         let defaults = state::tool_defaults(&req["tools"]);
         let mut upstream_request = protocol::request(&req, &model, &restored)?;
+        let search = upstream_request["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["type"] == "web_search"));
+        let search_limit = upstream_request.get("max_tool_calls").is_some();
+        let constrained_output =
+            stops.enabled() || upstream_request["text"]["format"]["type"] == "json_schema";
         if subscription {
             upstream_request = protocol::subscription_request(&req, upstream_request)?;
         }
@@ -176,6 +182,16 @@ impl OpenAiProvider {
             "x-tinyllm-continuation",
             HeaderValue::from_static(continuation),
         );
+        if search {
+            headers.insert(
+                "x-tinyllm-web-search",
+                HeaderValue::from_static(match (subscription, search_limit) {
+                    (true, true) => "native; citations=markdown; max-uses=best-effort",
+                    (false, true) => "native; citations=markdown; max-uses=upstream",
+                    (_, false) => "native; citations=markdown; max-uses=unset",
+                }),
+            );
+        }
         if stops.enabled() {
             headers.insert(
                 "x-tinyllm-stop-sequences",
@@ -207,6 +223,9 @@ impl OpenAiProvider {
                 loop {
                     let event = decoded.next().await.ok_or_else(|| Error::upstream("upstream stream ended before completion"))??;
                     let events = translator.accept(&event).map_err(|mut e| {e.message=e.message.replace(&key,"[redacted]");e})?;
+                    if constrained_output && let Some(native) = &translator.completed {
+                        reject_citation_controls(native)?;
+                    }
                     for event in events.into_iter().flat_map(|event| stops.push(event)) {
                         yield ApiEvent::Anthropic(serde_json::to_value(event).map_err(|_| Error::upstream("cannot encode stream event"))?);
                     }
@@ -251,6 +270,9 @@ impl OpenAiProvider {
                     e.message = e.message.replace(&key, "[redacted]");
                     e
                 })?;
+            if constrained_output {
+                reject_citation_controls(&native)?;
+            }
             stops.json(&response);
             stops.apply(&mut native, &mut response)?;
             self.store
@@ -275,6 +297,15 @@ impl OpenAiProvider {
             state_pins,
         })
     }
+}
+
+fn reject_citation_controls(native: &Value) -> Result<()> {
+    if !protocol::citation_sources(native)?.is_empty() {
+        return Err(Error::upstream(
+            "cited output with stop_sequences or structured output is unsupported",
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]

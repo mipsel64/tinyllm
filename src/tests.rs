@@ -114,6 +114,183 @@ fn request() -> Value {
 }
 
 #[test]
+fn web_search_request_maps_parameters_and_subscription_best_effort_cap() {
+    let mut req = request();
+    req["tools"].as_array_mut().unwrap().push(json!({
+        "type":"web_search_20250305","name":"web_search","max_uses":8,
+        "allowed_domains":["example.org","docs.example.org"],
+        "user_location":{"type":"approximate","country":"US","city":"Boston","region":"Massachusetts","timezone":"America/New_York"}
+    }));
+    req["tool_choice"] =
+        json!({"type":"tool","name":"web_search","disable_parallel_tool_use":true});
+    let out = protocol::request(&req, &model(), &Default::default()).unwrap();
+    assert_eq!(out["tools"][0]["type"], "function");
+    assert_eq!(
+        out["tools"][0]["parameters"],
+        req["tools"][0]["input_schema"]
+    );
+    assert_eq!(
+        out["tools"][1],
+        json!({
+            "type":"web_search","filters":{"allowed_domains":["example.org","docs.example.org"]},
+            "user_location":req["tools"][1]["user_location"]
+        })
+    );
+    assert_eq!(out["max_tool_calls"], 8);
+    assert_eq!(out["tool_choice"], json!({"type":"web_search"}));
+    assert_eq!(out["parallel_tool_calls"], false);
+    let subscription = protocol::subscription_request(&req, out.clone()).unwrap();
+    assert_eq!(subscription["tools"], out["tools"]);
+    assert_eq!(subscription["tool_choice"], out["tool_choice"]);
+    assert!(subscription.get("max_tool_calls").is_none());
+    assert!(subscription.get("max_output_tokens").is_none());
+    assert_eq!(subscription["stream"], true);
+    let instructions = subscription["instructions"].as_str().unwrap();
+    assert!(instructions.starts_with("Keep ALL instructions."));
+    assert!(instructions.contains("at most 8"), "{instructions}");
+    assert_eq!(subscription["input"][0]["content"][0]["text"], "hello");
+    for (choice, expected) in [
+        (json!({"type":"auto"}), json!("auto")),
+        (json!({"type":"any"}), json!("required")),
+        (json!({"type":"none"}), json!("none")),
+        (
+            json!({"type":"tool","name":"lookup"}),
+            json!({"type":"function","name":"lookup"}),
+        ),
+    ] {
+        req["tool_choice"] = choice;
+        assert_eq!(
+            protocol::request(&req, &model(), &Default::default()).unwrap()["tool_choice"],
+            expected
+        );
+    }
+    req.as_object_mut().unwrap().remove("tool_choice");
+    req["tools"] = json!([{"type":"web_search_20250305","name":"web_search"}]);
+    let out = protocol::request(&req, &model(), &Default::default()).unwrap();
+    assert_eq!(out["tools"], json!([{"type":"web_search"}]));
+    assert!(out.get("max_tool_calls").is_none());
+    assert_eq!(
+        protocol::subscription_request(&req, out).unwrap()["instructions"],
+        "Keep ALL instructions."
+    );
+    req["tool_choice"] = json!({"type":"tool","name":"web_search"});
+    assert_eq!(
+        protocol::request(&req, &model(), &Default::default()).unwrap()["tool_choice"],
+        "required"
+    );
+    req["tools"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"unloaded","input_schema":{"type":"object"},"defer_loading":true}));
+    assert_eq!(
+        protocol::request(&req, &model(), &Default::default()).unwrap()["tool_choice"],
+        "required"
+    );
+    req["tools"][0]["blocked_domains"] = json!(["example.org"]);
+    assert_eq!(
+        protocol::request(&req, &model(), &Default::default()).unwrap()["tools"][0]["filters"],
+        json!({"blocked_domains":["example.org"]})
+    );
+    req["tools"][0]["blocked_domains"] = json!([]);
+    req["tools"][0]["allowed_domains"] = json!([]);
+    req["stop_sequences"] = json!([]);
+    assert!(protocol::request(&req, &model(), &Default::default()).is_ok());
+    req["tools"][0]["allowed_domains"] = json!(
+        (0..100)
+            .map(|i| format!("site{i}.example.org"))
+            .collect::<Vec<_>>()
+    );
+    assert!(protocol::request(&req, &model(), &Default::default()).is_ok());
+}
+
+#[test]
+fn web_search_request_rejects_invalid_or_unsupported_options() {
+    let search = json!({"type":"web_search_20250305","name":"web_search"});
+    for change in [
+        json!({"type":"web_search_20260209"}),
+        json!({"type":"web_fetch_20250910"}),
+        json!({"type":42}),
+        json!({"name":"search"}),
+        json!({"max_uses":0}),
+        json!({"max_uses":-1}),
+        json!({"max_uses":1.5}),
+        json!({"max_uses":"8"}),
+        json!({"max_uses":true}),
+        json!({"allowed_domains":false}),
+        json!({"allowed_domains":[42]}),
+        json!({"allowed_domains":["https://example.org"]}),
+        json!({"allowed_domains":["example.org/path"]}),
+        json!({"allowed_domains":["*.example.org"]}),
+        json!({"allowed_domains":["example.org:443"]}),
+        json!({"blocked_domains":["example.org?query"]}),
+        json!({"blocked_domains":["example..org"]}),
+        json!({"blocked_domains":[""]}),
+        json!({"allowed_domains":["example.org"],"blocked_domains":["example.net"]}),
+        json!({"allowed_domains":(0..101).map(|i| format!("site{i}.example.org")).collect::<Vec<_>>()}),
+        json!({"user_location":{"type":"precise","country":"US"}}),
+        json!({"user_location":{"type":"approximate","country":"USA"}}),
+        json!({"user_location":{"type":"approximate","country":"12"}}),
+        json!({"user_location":{"type":"approximate","city":42}}),
+        json!({"user_location":{"type":"approximate","region":false}}),
+        json!({"user_location":{"type":"approximate","timezone":[]}}),
+        json!({"user_location":{"type":"approximate","latitude":42}}),
+        json!({"input_schema":{"type":"object"}}),
+        json!({"defer_loading":true}),
+        json!({"strict":true}),
+        json!({"unknown":true}),
+    ] {
+        let mut req = request();
+        req["tools"] = json!([search]);
+        req["tools"][0]
+            .as_object_mut()
+            .unwrap()
+            .extend(change.as_object().unwrap().clone());
+        assert!(
+            protocol::request(&req, &model(), &Default::default()).is_err(),
+            "{change}"
+        );
+    }
+    for kind in ["web_search_20260209", "web_search_20260318"] {
+        let mut req = request();
+        req["tools"] = json!([{"type":kind,"name":"web_search","max_uses":8}]);
+        assert!(
+            protocol::request(&req, &model(), &Default::default())
+                .unwrap_err()
+                .message
+                .contains("unsupported hosted tool type")
+        );
+    }
+    let custom = json!({"name":"web_search","input_schema":{"type":"object"}});
+    for tools in [
+        json!([search, search]),
+        json!([search, custom]),
+        json!([custom, search]),
+    ] {
+        let mut req = request();
+        req["tools"] = tools;
+        assert!(
+            protocol::request(&req, &model(), &Default::default()).is_err(),
+            "{}",
+            req["tools"]
+        );
+    }
+    for control in [
+        json!({"stop_sequences":["END"]}),
+        json!({"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{},"additionalProperties":false}}}}),
+    ] {
+        let mut req = request();
+        req["tools"] = json!([search]);
+        req.as_object_mut()
+            .unwrap()
+            .extend(control.as_object().unwrap().clone());
+        assert!(
+            protocol::request(&req, &model(), &Default::default()).is_err(),
+            "{control}"
+        );
+    }
+}
+
+#[test]
 fn ordered_history_images_tool_errors_and_choices() {
     let mut req = request();
     req["tool_choice"] = json!({"type":"tool","name":"lookup","disable_parallel_tool_use":true});
@@ -249,6 +426,229 @@ fn deferred_tools_load_from_references_without_losing_result_content() {
 
 fn upstream_response(output: Value) -> Value {
     json!({"id":"resp_test","status":"completed","output":output,"usage":{"input_tokens":120,"output_tokens":25,"input_tokens_details":{"cached_tokens":20},"output_tokens_details":{"reasoning_tokens":15}}})
+}
+
+#[tokio::test]
+async fn web_search_max_uses_eight_round_trip_restores_native_output_after_restart() {
+    use axum::{Json, Router, routing::post};
+    let mut native = web_search_stream_fixture().last().unwrap()["response"].clone();
+    native["output"].as_array_mut().unwrap().truncate(2);
+    native["output"].as_array_mut().unwrap().insert(0,
+        json!({"type":"web_search_call","id":"ws_failed","status":"failed","action":{"type":"search","query":"failed query"}}));
+    let (upstream, up_task) = serve(Router::new().route(
+        "/responses",
+        post({
+            let native = native.clone();
+            move |Json(req): Json<Value>| {
+                let native = native.clone();
+                async move {
+                    assert_eq!(req["model"], "gpt-test");
+                    assert_eq!(req["tools"], json!([{"type":"web_search"}]));
+                    assert_eq!(req["tool_choice"], "required");
+                    assert_eq!(req["max_tool_calls"], 8);
+                    assert_eq!(req["max_output_tokens"], 1024);
+                    assert_eq!(
+                        req["input"][0]["content"][0]["text"],
+                        "Keep ALL instructions."
+                    );
+                    assert_eq!(req["input"][1]["content"][0]["text"], "hello");
+                    Json(native)
+                }
+            }
+        }),
+    ))
+    .await;
+    let directory =
+        std::env::temp_dir().join(format!("tinyllm-web-search-{}", uuid::Uuid::new_v4()));
+    let (gateway, task) = serve(
+        crate::server::router(config(upstream, directory.clone()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let mut req = request();
+    req["tools"] = json!([{"type":"web_search_20250305","name":"web_search","max_uses":8}]);
+    req["tool_choice"] = json!({"type":"tool","name":"web_search"});
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/anthropic/v1/messages"))
+        .bearer_auth("local-secret")
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    assert_eq!(
+        response.headers()["x-tinyllm-web-search"],
+        "native; citations=markdown; max-uses=upstream"
+    );
+    let response: Value = response.json().await.unwrap();
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["stop_reason"], "end_turn");
+    assert_eq!(response["content"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        response["content"][1],
+        json!({"type":"text","text":"héllo"})
+    );
+    assert_eq!(
+        response["content"][2]["text"],
+        "\n\nSources:\n- <https://example.org/report>\n- <https://example.net/a%20b>"
+    );
+    task.abort();
+    let _ = task.await;
+    up_task.abort();
+    let _ = up_task.await;
+    let store = state::Store::open(directory.clone(), 100_000, 50_000)
+        .await
+        .unwrap();
+    req["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":response["content"]}),
+        json!({"role":"user","content":"Continue"}),
+    ]);
+    let restored = store
+        .restore_scoped(&req, "openai", "gpt-test")
+        .await
+        .unwrap();
+    assert_eq!(json!(restored[&1]), native["output"]);
+    let replay = protocol::request(&req, &model(), &restored).unwrap();
+    assert_eq!(replay["input"][2], native["output"][0]);
+    assert_eq!(replay["input"][3], native["output"][1]);
+    assert_eq!(replay["input"][4], native["output"][2]);
+    assert_eq!(replay["input"][5]["content"][0]["text"], "Continue");
+    let subscription = protocol::subscription_request(&req, replay).unwrap();
+    assert_eq!(subscription["input"][1], native["output"][0]);
+    assert_eq!(subscription["input"][2], native["output"][1]);
+    assert_eq!(subscription["input"][3], native["output"][2]);
+    assert!(subscription.get("max_tool_calls").is_none());
+    for index in [1, 2] {
+        let mut changed = req.clone();
+        changed["messages"][1]["content"][index]["text"] = json!("changed visible content");
+        assert!(
+            store
+                .restore_scoped(&changed, "openai", "gpt-test")
+                .await
+                .is_err()
+        );
+    }
+    req["messages"][1]["content"].as_array_mut().unwrap().pop();
+    assert!(
+        store
+            .restore_scoped(&req, "openai", "gpt-test")
+            .await
+            .is_err()
+    );
+    drop(store);
+    tokio::fs::remove_dir_all(directory).await.unwrap();
+}
+
+#[tokio::test]
+async fn web_search_unsolicited_citations_with_stops_or_structured_output_fail_json_and_sse() {
+    use axum::{Json, Router, response::IntoResponse, routing::post};
+    let mut events = web_search_stream_fixture();
+    events.retain(|event| event["output_index"] != 0);
+    for event in &mut events {
+        if let Some(index) = event["output_index"].as_u64() {
+            event["output_index"] = json!(index - 1);
+        }
+    }
+    events.last_mut().unwrap()["response"]["output"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
+    for event in &mut events {
+        if event["type"] == "response.output_text.delta" {
+            event["delta"] = json!(if event["delta"] == "hé" {
+                "{\"answer\":\"hé"
+            } else {
+                "llo\"}"
+            });
+        }
+        for pointer in [
+            "/text",
+            "/part/text",
+            "/item/content/0/text",
+            "/response/output/0/content/0/text",
+        ] {
+            if let Some(text) = event.pointer_mut(pointer)
+                && *text == "héllo"
+            {
+                *text = json!("{\"answer\":\"héllo\"}");
+            }
+        }
+    }
+    let native = events.last().unwrap()["response"].clone();
+    let raw = events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+    let (upstream, up_task) = serve(Router::new().route(
+        "/responses",
+        post(move |Json(req): Json<Value>| {
+            let native = native.clone();
+            let raw = raw.clone();
+            async move {
+                assert_eq!(req["tools"][0]["type"], "function");
+                if req["stream"] == true {
+                    ([("content-type", "text/event-stream")], raw).into_response()
+                } else {
+                    Json(native).into_response()
+                }
+            }
+        }),
+    ))
+    .await;
+    let directory =
+        std::env::temp_dir().join(format!("tinyllm-web-search-stop-{}", uuid::Uuid::new_v4()));
+    let (gateway, task) = serve(
+        crate::server::router(config(upstream, directory.clone()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    for control in [
+        json!({"stop_sequences":["éll"]}),
+        json!({"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}}}),
+    ] {
+        for streaming in [false, true] {
+            let mut req = request();
+            req.as_object_mut()
+                .unwrap()
+                .extend(control.as_object().unwrap().clone());
+            req["stream"] = json!(streaming);
+            let response = reqwest::Client::new()
+                .post(format!("{gateway}/anthropic/v1/messages"))
+                .bearer_auth("local-secret")
+                .json(&req)
+                .send()
+                .await
+                .unwrap();
+            if streaming {
+                assert_eq!(response.status(), 200);
+                let response = response.text().await.unwrap();
+                assert!(
+                    response.contains(
+                        "cited output with stop_sequences or structured output is unsupported"
+                    ),
+                    "{control}: {response}"
+                );
+                assert!(
+                    !response.contains("event: message_stop"),
+                    "{control}: {response}"
+                );
+                assert!(!response.contains("Sources:"), "{control}: {response}");
+            } else {
+                assert_eq!(response.status(), 502, "{control}");
+                assert_eq!(
+                    response.json::<Value>().await.unwrap()["error"]["message"],
+                    "cited output with stop_sequences or structured output is unsupported"
+                );
+            }
+        }
+    }
+    task.abort();
+    let _ = task.await;
+    up_task.abort();
+    let _ = up_task.await;
+    tokio::fs::remove_dir_all(directory).await.unwrap();
 }
 
 #[tokio::test]
@@ -780,6 +1180,333 @@ fn stream_fixture() -> Vec<Value> {
         json!({"type":"response.output_item.done","output_index":1,"item":a}),
         json!({"type":"response.completed","response":upstream_response(json!([text,a,b]))}),
     ]
+}
+
+fn web_search_stream_fixture() -> Vec<Value> {
+    let search = json!({"type":"web_search_call","id":"ws","status":"completed","action":{"type":"search","query":"fixture","sources":[{"type":"url","url":"https://example.org/report"}]}});
+    let annotations = json!([
+        {"type":"url_citation","url":"https://example.org/report","title":"\n- [Injected](javascript:alert(1))","start_index":0,"end_index":5},
+        {"type":"url_citation","url":"https://EXAMPLE.org:443/report","title":"Duplicate","start_index":0,"end_index":2},
+        {"type":"url_citation","url":"https://example.net/a%20b","title":"Second source","start_index":2,"end_index":5}
+    ]);
+    let mut events = stream_fixture();
+    for event in &mut events {
+        if let Some(index) = event["output_index"].as_u64() {
+            event["output_index"] = json!(index + 1);
+        }
+    }
+    events[6]["part"]["annotations"] = annotations.clone();
+    events[7]["item"]["content"][0]["annotations"] = annotations.clone();
+    events.last_mut().unwrap()["response"]["output"][0]["content"][0]["annotations"] =
+        annotations.clone();
+    events.last_mut().unwrap()["response"]["output"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, search.clone());
+    events.splice(5..5, annotations.as_array().unwrap().iter().enumerate().map(|(index, annotation)| {
+        json!({"type":"response.output_text.annotation.added","output_index":1,"item_id":"m","content_index":0,"annotation_index":index,"annotation":annotation})
+    }));
+    events.splice(1..1, [
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws","status":"in_progress"}}),
+        json!({"type":"response.web_search_call.in_progress","output_index":0,"item_id":"ws"}),
+        json!({"type":"response.web_search_call.searching","output_index":0,"item_id":"ws"}),
+        json!({"type":"response.web_search_call.completed","output_index":0,"item_id":"ws"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":search}),
+    ]);
+    events
+}
+
+#[test]
+fn web_search_terminal_items_preserve_the_answer_and_opaque_actions() {
+    use crate::models::anthropic::{Delta, StreamEvent};
+    let baseline = web_search_stream_fixture();
+    let expected = protocol::response(
+        &baseline.last().unwrap()["response"],
+        "openai/gpt-test",
+        "reference",
+    )
+    .unwrap();
+    for status in ["failed", "incomplete", "completed"] {
+        for sparse in [false, true] {
+            let mut events = baseline.clone();
+            events.retain(|event| {
+                status == "completed" || event["type"] != "response.web_search_call.completed"
+            });
+            let action = if status == "completed" {
+                json!({"type":"provider_extension","opaque":[1,2,3]})
+            } else {
+                baseline.last().unwrap()["response"]["output"][0]["action"].clone()
+            };
+            let item = json!({"type":"web_search_call","id":"ws","status":status,"action":action});
+            events
+                .iter_mut()
+                .find(|event| {
+                    event["type"] == "response.output_item.done" && event["output_index"] == 0
+                })
+                .unwrap()["item"] = item.clone();
+            events.last_mut().unwrap()["response"]["output"][0] = item;
+            let native = events.last().unwrap()["response"].clone();
+            let response = protocol::response(&native, "openai/gpt-test", "reference").unwrap();
+            assert_eq!(json!(response.content), json!(expected.content));
+            if sparse {
+                events.last_mut().unwrap()["response"]["output"] = json!([]);
+            }
+            let mut translator =
+                stream::Translator::new("openai/gpt-test".into(), "reference".into());
+            translator.sparse_completion = sparse;
+            let mut text = String::new();
+            for event in &events {
+                for event in translator.accept(event).unwrap() {
+                    if let StreamEvent::ContentBlockDelta {
+                        delta: Delta::Text { text: delta },
+                        ..
+                    } = event
+                    {
+                        text.push_str(&delta);
+                    }
+                }
+            }
+            assert_eq!(translator.completed.as_ref(), Some(&native));
+            assert_eq!(
+                text,
+                "héllo\n\nSources:\n- <https://example.org/report>\n- <https://example.net/a%20b>"
+            );
+            let mut failed = native;
+            failed["status"] = json!("failed");
+            assert!(protocol::response(&failed, "openai/gpt-test", "reference").is_err());
+        }
+    }
+}
+
+#[test]
+fn web_search_json_preserves_text_and_validates_citations() {
+    let events = web_search_stream_fixture();
+    let native = events.last().unwrap()["response"].clone();
+    for action in [
+        native["output"][0]["action"].clone(),
+        json!({"type":"open_page","url":"https://example.org/report"}),
+        json!({"type":"find_in_page","url":"https://example.org/report","pattern":"fixture"}),
+    ] {
+        let mut response = native.clone();
+        response["output"][0]["action"] = action;
+        let response = protocol::response(&response, "openai/gpt-test", "reference").unwrap();
+        assert_eq!(
+            json!(response.content),
+            json!([
+                {"type":"redacted_thinking","data":"reference"},
+                {"type":"text","text":"héllo"},
+                {"type":"tool_use","id":"call_a","name":"lookup","input":{"a":1}},
+                {"type":"tool_use","id":"call_b","name":"lookup","input":{"b":2}},
+                {"type":"text","text":"\n\nSources:\n- <https://example.org/report>\n- <https://example.net/a%20b>"}
+            ])
+        );
+        assert_eq!(response.stop_reason.as_deref(), Some("tool_use"));
+    }
+    for (pointer, value) in [
+        ("/output/0/id", json!(null)),
+        ("/output/0/status", json!("searching")),
+        ("/output/0/status", json!("in_progress")),
+        ("/output/1/content/0/annotations", json!({})),
+        (
+            "/output/1/content/0/annotations/0/type",
+            json!("file_citation"),
+        ),
+        ("/output/1/content/0/annotations/0/title", json!(42)),
+        ("/output/1/content/0/annotations/0/start_index", json!(-1)),
+        ("/output/1/content/0/annotations/0/start_index", json!(6)),
+        ("/output/1/content/0/annotations/0/end_index", json!(1.5)),
+        (
+            "/output/1/content/0/annotations/0/url",
+            json!("javascript:alert(1)"),
+        ),
+        ("/output/1/content/0/annotations/0/url", json!("/relative")),
+        (
+            "/output/1/content/0/annotations/0/url",
+            json!("https://user:password@example.org/"),
+        ),
+        (
+            "/output/1/content/0/annotations/0/url",
+            json!("https://example.org/\nInjected"),
+        ),
+    ] {
+        let mut changed = native.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            protocol::response(&changed, "openai/gpt-test", "reference").is_err(),
+            "{pointer}: {}",
+            changed.pointer(pointer).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn web_search_fragmented_sse_matches_json_and_sparse_subscription_output() {
+    use futures::StreamExt;
+    for sparse in [false, true] {
+        let mut events = web_search_stream_fixture();
+        let native = events.last().unwrap()["response"].clone();
+        if sparse {
+            events.last_mut().unwrap()["response"]["output"] = json!([]);
+            events.last_mut().unwrap()["response"]
+                .as_object_mut()
+                .unwrap()
+                .remove("status");
+        }
+        let raw = events.iter().map(|event| format!(
+            ": keep-alive\r\n\r\nevent: ping\r\ndata: {{\"type\":\"ping\"}}\r\n\r\nevent: {}\r\ndata: {event}\r\n\r\n",
+            event["type"].as_str().unwrap()
+        )).collect::<String>();
+        let upstream = futures::stream::iter(
+            raw.bytes()
+                .map(|b| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b])))
+                .collect::<Vec<_>>(),
+        );
+        let mut decoded = Box::pin(stream::decode(upstream, 1_000_000));
+        let mut translator = stream::Translator::new("openai/gpt-test".into(), "reference".into());
+        translator.sparse_completion = sparse;
+        let mut output = Vec::new();
+        while let Some(event) = decoded.next().await {
+            output.extend(
+                translator
+                    .accept(&event.unwrap())
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| json!(e)),
+            );
+        }
+        assert_eq!(translator.completed.as_ref(), Some(&native));
+        let response = protocol::response(&native, "openai/gpt-test", "reference").unwrap();
+        let mut content = Vec::<Value>::new();
+        let mut open = None;
+        let mut arguments = String::new();
+        for event in output {
+            let index = event["index"].as_u64().map(|index| index as usize);
+            match event["type"].as_str().unwrap() {
+                "content_block_start" => {
+                    assert!(open.replace(index.unwrap()).is_none());
+                    assert_eq!(index, Some(content.len()));
+                    content.push(event["content_block"].clone());
+                    arguments.clear();
+                }
+                "content_block_delta" => {
+                    assert_eq!(index, open);
+                    match event["delta"]["type"].as_str().unwrap() {
+                        "text_delta" => {
+                            let block = &mut content[index.unwrap()];
+                            block["text"] = json!(format!(
+                                "{}{}",
+                                block["text"].as_str().unwrap(),
+                                event["delta"]["text"].as_str().unwrap()
+                            ));
+                        }
+                        "input_json_delta" => {
+                            arguments.push_str(event["delta"]["partial_json"].as_str().unwrap())
+                        }
+                        other => panic!("unexpected delta: {other}"),
+                    }
+                }
+                "content_block_stop" => {
+                    assert_eq!(open.take(), index);
+                    let block = &mut content[index.unwrap()];
+                    if block["type"] == "tool_use" {
+                        block["input"] = serde_json::from_str(&arguments).unwrap();
+                    }
+                }
+                "message_start" => {}
+                other => panic!("unexpected event: {other}"),
+            }
+        }
+        assert!(open.is_none());
+        assert_eq!(json!(content), json!(response.content));
+        assert_eq!(json!(stream::finish(&response))[1]["type"], "message_stop");
+    }
+}
+
+#[test]
+fn web_search_sse_rejects_invalid_progress_and_changed_annotations() {
+    for (kind, pointer, value) in [
+        (
+            "response.web_search_call.searching",
+            "/item_id",
+            json!("wrong"),
+        ),
+        (
+            "response.web_search_call.searching",
+            "/output_index",
+            json!(1),
+        ),
+        (
+            "response.web_search_call.searching",
+            "/type",
+            json!("response.web_search_call.failed"),
+        ),
+        (
+            "response.web_search_call.searching",
+            "/type",
+            json!("response.web_search_call.unknown"),
+        ),
+        (
+            "response.output_item.done",
+            "/item/status",
+            json!("in_progress"),
+        ),
+        ("response.output_item.done", "/item/id", json!("wrong")),
+        (
+            "response.output_text.annotation.added",
+            "/item_id",
+            json!("wrong"),
+        ),
+        (
+            "response.output_text.annotation.added",
+            "/annotation_index",
+            json!(1),
+        ),
+        (
+            "response.output_text.annotation.added",
+            "/annotation/type",
+            json!("file_citation"),
+        ),
+        (
+            "response.output_text.annotation.added",
+            "/annotation/url",
+            json!("javascript:alert(1)"),
+        ),
+        (
+            "response.content_part.done",
+            "/part/annotations/0/url",
+            json!("https://changed.example.org/"),
+        ),
+        ("response.content_part.done", "/part/annotations", json!([])),
+        (
+            "response.completed",
+            "/response/output/1/content/0/annotations/0/url",
+            json!("https://changed.example.org/"),
+        ),
+    ] {
+        let mut events = web_search_stream_fixture();
+        let event = events
+            .iter_mut()
+            .find(|event| event["type"] == kind)
+            .unwrap();
+        *event.pointer_mut(pointer).unwrap() = value;
+        let mut translator = stream::Translator::new("openai/gpt-test".into(), "reference".into());
+        let result = events
+            .iter()
+            .try_for_each(|event| translator.accept(event).map(|_| ()));
+        assert!(result.is_err(), "{kind} {pointer}");
+        assert!(translator.completed.is_none(), "{kind} {pointer}");
+    }
+    let mut events = web_search_stream_fixture();
+    events.last_mut().unwrap()["type"] = json!("response.failed");
+    events.last_mut().unwrap()["response"]["status"] = json!("failed");
+    let mut translator = stream::Translator::new("openai/gpt-test".into(), "reference".into());
+    assert!(
+        events
+            .iter()
+            .try_for_each(|event| translator.accept(event).map(|_| ()))
+            .is_err()
+    );
+    assert!(translator.completed.is_none());
 }
 
 #[test]

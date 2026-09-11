@@ -15,6 +15,7 @@ background shells and subagents; tinyllm translates the API traffic.
 - Anthropic Messages, OpenAI Chat Completions and Responses, with JSON or streaming SSE.
 - Text, images, multiple tool calls and structured tool results.
 - MCP tools, including deferred ToolSearch, concurrent subagents and background shells through Claude Code.
+- Claude Code WebSearch through OpenAI native search, with domain filters and source links.
 - OpenAI reasoning continuation through tool calls, restarts and retained history after compaction.
 - Subscription login and automatic token refresh; per-model reasoning effort and OpenAI service tier defaults.
 

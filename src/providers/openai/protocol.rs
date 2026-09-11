@@ -78,7 +78,7 @@ pub fn request(
         .as_u64()
         .filter(|n| *n > 0)
         .ok_or_else(|| Error::invalid("max_tokens must be positive"))?;
-    super::stop::StopFilter::new(&req["stop_sequences"])?;
+    let stops = super::stop::StopFilter::new(&req["stop_sequences"])?;
     if !req["top_k"].is_null() {
         return Err(Error::invalid("top_k is unsupported by Responses"));
     }
@@ -237,12 +237,44 @@ pub fn request(
     out["input"] = json!(input);
     let mut names = HashSet::new();
     let mut available = HashSet::new();
+    let mut search = false;
     if let Some(tools) = req.get("tools") {
         let tools = tools
             .as_array()
             .ok_or_else(|| Error::invalid("tools must be an array"))?;
         let mut translated = Vec::new();
         for tool in tools {
+            let name = string(tool, "name")?;
+            valid_name(name)?;
+            if !names.insert(name) {
+                return Err(Error::invalid("duplicate tool name"));
+            }
+            if tool["type"] == "web_search_20250305" {
+                if stops.enabled() {
+                    return Err(Error::invalid(
+                        "web search with stop_sequences is unsupported",
+                    ));
+                }
+                translated.push(web_search_tool(tool)?);
+                if let Some(limit) = tool.get("max_uses").filter(|v| !v.is_null()) {
+                    out["max_tool_calls"] = json!(
+                        limit
+                            .as_u64()
+                            .filter(|n| *n > 0)
+                            .ok_or_else(|| Error::invalid(
+                                "web search max_uses must be positive"
+                            ))?
+                    );
+                }
+                available.insert(name);
+                search = true;
+                continue;
+            }
+            if tool.get("type").is_some_and(|v| v != "custom") {
+                return Err(Error::invalid(
+                    "unsupported hosted tool type; only web_search_20250305 is supported",
+                ));
+            }
             fields(
                 tool,
                 &[
@@ -256,22 +288,12 @@ pub fn request(
                     "input_examples",
                 ],
             )?;
-            if tool.get("type").is_some_and(|v| v != "custom") {
-                return Err(Error::invalid(
-                    "hosted tools are unsupported; use Claude Code's client-side ToolSearch",
-                ));
-            }
             let deferred = match tool.get("defer_loading") {
                 None => false,
                 Some(value) => value
                     .as_bool()
                     .ok_or_else(|| Error::invalid("defer_loading must be boolean"))?,
             };
-            let name = string(tool, "name")?;
-            valid_name(name)?;
-            if !names.insert(name) {
-                return Err(Error::invalid("duplicate tool name"));
-            }
             if !tool["input_schema"].is_object() {
                 return Err(Error::invalid("input_schema must be a JSON schema object"));
             }
@@ -317,6 +339,13 @@ pub fn request(
             "auto" => json!("auto"),
             "none" => json!("none"),
             "any" if !available.is_empty() => json!("required"),
+            "tool" if search && choice["name"] == "web_search" => {
+                if available.len() == 1 {
+                    json!("required")
+                } else {
+                    json!({"type":"web_search"})
+                }
+            }
             "tool" if available.contains(string(choice, "name")?) => {
                 json!({"type":"function","name":choice["name"]})
             }
@@ -366,6 +395,11 @@ pub fn request(
             );
         }
         if let Some(format) = config.get("format") {
+            if search {
+                return Err(Error::invalid(
+                    "web search with structured output is unsupported",
+                ));
+            }
             fields(format, &["type", "schema"])?;
             if format["type"] != "json_schema" || !format["schema"].is_object() {
                 return Err(Error::invalid("unsupported output format"));
@@ -398,6 +432,111 @@ pub fn request(
     Ok(out)
 }
 
+fn web_search_tool(tool: &Value) -> Result<Value> {
+    fields(
+        tool,
+        &[
+            "type",
+            "name",
+            "max_uses",
+            "allowed_domains",
+            "blocked_domains",
+            "user_location",
+            "cache_control",
+            "allowed_callers",
+        ],
+    )?;
+    if tool["name"] != "web_search" {
+        return Err(Error::invalid("hosted web search must be named web_search"));
+    }
+    if tool
+        .get("allowed_callers")
+        .is_some_and(|v| *v != json!(["direct"]))
+    {
+        return Err(Error::invalid("web search supports only direct calls"));
+    }
+    let mut out = json!({"type":"web_search"});
+    let mut filters = serde_json::Map::new();
+    for key in ["allowed_domains", "blocked_domains"] {
+        if let Some(domains) = tool.get(key).filter(|v| !v.is_null()) {
+            let domains = domains
+                .as_array()
+                .filter(|v| v.len() <= 100)
+                .ok_or_else(|| {
+                    Error::invalid("web search domain lists must contain at most 100 domains")
+                })?;
+            let mut values = Vec::new();
+            for domain in domains {
+                let domain = domain
+                    .as_str()
+                    .filter(|s| !s.is_empty() && s.len() <= 253)
+                    .ok_or_else(|| {
+                        Error::invalid("web search domains must be bare ASCII hostnames")
+                    })?;
+                if !domain.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                }) {
+                    return Err(Error::invalid(
+                        "web search domains must be bare ASCII hostnames; paths, schemes and wildcards are unsupported",
+                    ));
+                }
+                values.push(json!(domain.to_ascii_lowercase()));
+            }
+            if !values.is_empty() {
+                filters.insert(key.into(), json!(values));
+            }
+        }
+    }
+    if filters.len() > 1 {
+        return Err(Error::invalid(
+            "web search cannot combine allowed_domains and blocked_domains",
+        ));
+    }
+    if !filters.is_empty() {
+        out["filters"] = Value::Object(filters);
+    }
+    if let Some(location) = tool.get("user_location").filter(|v| !v.is_null()) {
+        fields(location, &["type", "city", "region", "country", "timezone"])?;
+        if location["type"] != "approximate" {
+            return Err(Error::invalid(
+                "web search user_location must be approximate",
+            ));
+        }
+        let mut present = false;
+        for key in ["city", "region", "country", "timezone"] {
+            if let Some(value) = location.get(key) {
+                let text = value
+                    .as_str()
+                    .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+                    .ok_or_else(|| {
+                        Error::invalid("web search location values must be nonempty strings")
+                    })?;
+                if key == "country"
+                    && (text.len() != 2 || !text.bytes().all(|c| c.is_ascii_alphabetic()))
+                {
+                    return Err(Error::invalid(
+                        "web search country must be a two-letter code",
+                    ));
+                }
+                present = true;
+            }
+        }
+        if !present {
+            return Err(Error::invalid(
+                "web search user_location must specify a location",
+            ));
+        }
+        out["user_location"] = location.clone();
+    }
+    Ok(out)
+}
+
 pub fn subscription_request(req: &Value, mut out: Value) -> Result<Value> {
     if out.get("temperature").is_some() || out.get("top_p").is_some() {
         return Err(Error::invalid(
@@ -420,6 +559,12 @@ pub fn subscription_request(req: &Value, mut out: Value) -> Result<Value> {
         if item["role"] == "system" {
             item["role"] = json!("developer");
         }
+    }
+    if let Some(limit) = out.as_object_mut().unwrap().remove("max_tool_calls") {
+        instructions.push(format!(
+            "Search budget: use the web_search tool at most {limit} times for this response."
+        ));
+        tracing::warn!(max_uses = %limit, "subscription web search limit is best-effort; the backend does not support a hard cap");
     }
     out["instructions"] = json!(instructions.join("\n\n"));
     out["stream"] = json!(true);
@@ -531,6 +676,83 @@ pub fn usage(response: &Value) -> Result<Usage> {
     })
 }
 
+pub(super) fn web_search_output(item: &Value) -> Result<()> {
+    if item["id"].as_str().is_none_or(str::is_empty)
+        || !matches!(
+            item["status"].as_str(),
+            Some("completed" | "failed" | "incomplete")
+        )
+    {
+        return Err(Error::upstream(
+            "web search output has no ID or a nonterminal status",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn citation_url(annotation: &Value) -> Result<String> {
+    if annotation["type"] != "url_citation"
+        || !annotation["title"].is_string()
+        || annotation["start_index"]
+            .as_u64()
+            .zip(annotation["end_index"].as_u64())
+            .is_none_or(|(start, end)| start > end)
+    {
+        return Err(Error::upstream(
+            "unsupported or malformed output annotation",
+        ));
+    }
+    let url = annotation["url"]
+        .as_str()
+        .filter(|s| !s.chars().any(char::is_control))
+        .and_then(|s| reqwest::Url::parse(s).ok())
+        .filter(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+        .ok_or_else(|| Error::upstream("citation URL must be HTTP(S) without credentials"))?;
+    Ok(url.into())
+}
+
+pub(super) fn annotations(part: &Value) -> Result<&[Value]> {
+    let annotations = match part.get("annotations") {
+        None | Some(Value::Null) => return Ok(&[]),
+        Some(Value::Array(values)) => values,
+        _ => return Err(Error::upstream("output annotations must be an array")),
+    };
+    Ok(annotations)
+}
+
+pub(super) fn citation_sources(response: &Value) -> Result<String> {
+    let mut seen = HashSet::new();
+    let mut sources = String::new();
+    for item in response["output"]
+        .as_array()
+        .ok_or_else(|| Error::upstream("upstream output missing"))?
+    {
+        if item["type"] != "message" {
+            continue;
+        }
+        for part in item["content"]
+            .as_array()
+            .ok_or_else(|| Error::upstream("upstream message content missing"))?
+        {
+            for annotation in annotations(part)? {
+                let url = citation_url(annotation)?;
+                if seen.insert(url.clone()) {
+                    if sources.is_empty() {
+                        sources.push_str("\n\nSources:");
+                    }
+                    sources.push_str(&format!("\n- <{url}>"));
+                }
+            }
+        }
+    }
+    Ok(sources)
+}
+
 pub fn response(response: &Value, alias: &str, reference: &str) -> Result<AnthropicResponse> {
     if response["status"] == "failed" {
         return Err(Error::openai(response));
@@ -563,15 +785,7 @@ pub fn response(response: &Value, alias: &str, reference: &str) -> Result<Anthro
                     .ok_or_else(|| Error::upstream("upstream message content missing"))?
                 {
                     let text = match part["type"].as_str() {
-                        Some("output_text") => {
-                            if part["annotations"]
-                                .as_array()
-                                .is_some_and(|a| !a.is_empty())
-                            {
-                                return Err(Error::upstream("annotated output is unsupported"));
-                            }
-                            part["text"].as_str()
-                        }
+                        Some("output_text") => part["text"].as_str(),
                         Some("refusal") => {
                             refusal = true;
                             part["refusal"].as_str()
@@ -585,6 +799,7 @@ pub fn response(response: &Value, alias: &str, reference: &str) -> Result<Anthro
                     });
                 }
             }
+            Some("web_search_call") => web_search_output(item)?,
             Some("function_call") => {
                 let input: Value = serde_json::from_str(
                     item["arguments"]
@@ -619,6 +834,13 @@ pub fn response(response: &Value, alias: &str, reference: &str) -> Result<Anthro
             }
             _ => return Err(Error::upstream("unsupported upstream output item")),
         }
+    }
+    let sources = citation_sources(response)?;
+    if !sources.is_empty() {
+        content.push(ResponseContent::Text {
+            content_type: "text".into(),
+            text: sources,
+        });
     }
     let reason = match response["status"].as_str() {
         Some("completed") => {
