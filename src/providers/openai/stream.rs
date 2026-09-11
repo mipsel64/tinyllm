@@ -1,3 +1,4 @@
+use super::protocol;
 use crate::{Result, error::Error, models::anthropic::*};
 use bytes::Bytes;
 use eventsource_stream::Eventsource;
@@ -50,6 +51,8 @@ struct Block {
     start: ContentBlockStart,
     text: String,
     deltas: VecDeque<Delta>,
+    annotations: Vec<Value>,
+    annotations_done: bool,
     done: bool,
     index: Option<usize>,
 }
@@ -60,6 +63,8 @@ impl Block {
             start,
             text: String::new(),
             deltas: VecDeque::new(),
+            annotations: Vec::new(),
+            annotations_done: false,
             done: false,
             index: None,
         }
@@ -75,6 +80,23 @@ impl Block {
             },
             _ => Delta::Text { text: text.into() },
         });
+        Ok(())
+    }
+    fn observe_annotations(&mut self, part: &Value, done: bool) -> Result<()> {
+        let annotations = protocol::annotations(part)?;
+        if !annotations.starts_with(&self.annotations)
+            || (self.annotations_done && annotations != self.annotations)
+        {
+            return Err(Error::upstream(
+                "completed annotations differ from streamed annotations",
+            ));
+        }
+        let added = &annotations[self.annotations.len()..];
+        for annotation in added {
+            protocol::citation_url(annotation)?;
+        }
+        self.annotations.extend_from_slice(added);
+        self.annotations_done = done;
         Ok(())
     }
     fn finish(&mut self, expected: &str) -> Result<()> {
@@ -216,7 +238,7 @@ impl Translator {
                             ));
                         }
                     }
-                    "reasoning" => {}
+                    "reasoning" | "web_search_call" => {}
                     _ => return Err(Error::upstream("unsupported upstream output item")),
                 }
                 self.items.push(state);
@@ -245,7 +267,39 @@ impl Translator {
                 if !initial.is_empty() {
                     block.append(initial)?;
                 }
+                block.observe_annotations(part, false)?;
                 item.blocks.push(block);
+            }
+            "response.web_search_call.in_progress"
+            | "response.web_search_call.searching"
+            | "response.web_search_call.completed" => {
+                let item = self.item(event)?;
+                if item.kind != "web_search_call" || item.complete.is_some() {
+                    return Err(Error::upstream(
+                        "web search event refers to a non-search or completed item",
+                    ));
+                }
+            }
+            "response.output_text.annotation.added" => {
+                let item = self.item(event)?;
+                if item.kind != "message" || item.complete.is_some() {
+                    return Err(Error::upstream(
+                        "annotation event refers to a non-message or completed item",
+                    ));
+                }
+                let block = item
+                    .blocks
+                    .get_mut(number(event, "content_index")?)
+                    .ok_or_else(|| {
+                        Error::upstream("annotation refers to an unknown content block")
+                    })?;
+                if block.annotations_done
+                    || number(event, "annotation_index")? != block.annotations.len()
+                {
+                    return Err(Error::upstream("out-of-order or late output annotation"));
+                }
+                protocol::citation_url(&event["annotation"])?;
+                block.annotations.push(event["annotation"].clone());
             }
             "response.output_text.delta"
             | "response.refusal.delta"
@@ -277,19 +331,14 @@ impl Translator {
             }
             "response.content_part.done" => {
                 let part = &event["part"];
-                if part["annotations"]
-                    .as_array()
-                    .is_some_and(|a| !a.is_empty())
-                {
-                    return Err(Error::upstream("annotated output is unsupported"));
-                }
                 let key = if part["type"] == "refusal" {
                     "refusal"
                 } else {
                     "text"
                 };
-                self.block(event, number(event, "content_index")?)?
-                    .finish(text(part, key)?)?;
+                let block = self.block(event, number(event, "content_index")?)?;
+                block.observe_annotations(part, true)?;
+                block.finish(text(part, key)?)?;
             }
             "response.output_item.done" => {
                 let item = self.item(event)?;
@@ -317,6 +366,7 @@ impl Translator {
                             return Err(Error::upstream("completed message content changed"));
                         }
                         for (block, part) in item.blocks.iter_mut().zip(parts) {
+                            block.observe_annotations(part, true)?;
                             block.finish(text(
                                 part,
                                 if part["type"] == "refusal" {
@@ -327,6 +377,7 @@ impl Translator {
                             )?)?;
                         }
                     }
+                    "web_search_call" => protocol::web_search_output(final_item)?,
                     _ => {}
                 }
                 item.complete = Some(final_item.clone());
@@ -379,6 +430,26 @@ impl Translator {
             }
         }
         self.drain(&mut events);
+        if let Some(response) = &self.completed {
+            let sources = protocol::citation_sources(response)?;
+            if !sources.is_empty() {
+                let index = self.next_index;
+                self.next_index += 1;
+                events.extend([
+                    StreamEvent::ContentBlockStart {
+                        index,
+                        content_block: ContentBlockStart::Text {
+                            text: String::new(),
+                        },
+                    },
+                    StreamEvent::ContentBlockDelta {
+                        index,
+                        delta: Delta::Text { text: sources },
+                    },
+                    StreamEvent::ContentBlockStop { index },
+                ]);
+            }
+        }
         Ok(events)
     }
 

@@ -15,6 +15,7 @@ background shells and subagents; tinyllm translates the API traffic.
 - Anthropic Messages, OpenAI Chat Completions and Responses, with JSON or streaming SSE.
 - Text, images, multiple tool calls and structured tool results.
 - MCP tools, including deferred ToolSearch, concurrent subagents and background shells through Claude Code.
+- Claude Code WebSearch through OpenAI native search, with domain filters and source links.
 - OpenAI reasoning continuation through tool calls, restarts and retained history after compaction.
 - Subscription login and automatic token refresh; per-model reasoning effort and OpenAI service tier defaults.
 
@@ -105,6 +106,18 @@ ToolSearch is supported; `ENABLE_TOOL_SEARCH=false` loads all MCP definitions
 upfront and uses more context. Experimental betas need no blanket disabling.
 Avoid `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: it disables Monitor.
 tinyllm does not change global Claude settings.
+
+OpenAI WebSearch supports `web_search_20250305`, bare-domain allow/block lists and
+approximate location. Answers include Markdown source links; native search state
+is preserved for continuation. With an API key, `max_uses` maps to the upstream
+`max_tool_calls` cap. Subscription access has no hard-cap parameter: the limit is
+best-effort through model instructions, with a warning and an
+`x-tinyllm-web-search` response header. Newer dynamic-filtering search versions,
+domain paths/wildcards and search combined with stop sequences or structured output
+are unsupported. Cited output cannot be combined with either output constraint.
+Citation conversion also applies when no search tool was declared. Failed or
+incomplete search attempts stay in native state without discarding an otherwise
+valid answer; whole-response failures still return errors.
 
 ### Connect other clients
 
