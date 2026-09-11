@@ -34,8 +34,11 @@ Linux (AMD64/ARM64), verify it with `checksums.txt`, and put `tinyllm` on your P
 Or install from this checkout:
 
 ```sh
-cargo install --locked --path .
+make install
 ```
+
+This builds in release mode and installs to `~/.local/bin/tinyllm`. Add
+`~/.local/bin` to your `PATH` if needed.
 
 `tinyllm --version` prints `<cargo-version>+<short-commit> <UTC-timestamp>`,
 prefixed by the binary name, for example `tinyllm 0.1.0+abc1234 2026-09-10T12:34:56Z`.
@@ -119,6 +122,25 @@ and your local gateway token as its API key (`tinyllm` when auth is disabled).
 | Responses | `POST /v1/responses` | `GET /v1/models` |
 
 ### Run as a service
+
+From a source checkout, run these as your normal user:
+
+| Command | Action |
+| --- | --- |
+| `make build` | Build in release mode. |
+| `make install` | Build and install to `~/.local/bin/tinyllm`. |
+| `make setup` | Check config, install, then enable and start the native service. |
+| `make restart` | Restart the service gracefully, without rebuilding. |
+| `make restart REBUILD=1` | Build, install, then restart. |
+| `make status` | Print the current launchd/systemd service status. |
+| `make clean` | Stop and remove the service and installed binary; keep config, credentials, state and logs. |
+
+`setup` stops before building if `~/.config/tinyllm/config.toml` is missing and
+prints instructions to copy the example and fill the required provider/auth fields.
+Edit the config and complete subscription login (if used) before setup.
+macOS uses the system LaunchDaemon and prompts for `sudo`; Linux uses a systemd
+user service. Enable Linux lingering as described below for startup without login.
+Existing private plist customizations are retained; `clean` does not disable lingering.
 
 Use the [macOS launchd, Linux systemd and Docker Compose examples](examples/README.md)
 for boot startup, logs, persistent state and graceful shutdown. The image
