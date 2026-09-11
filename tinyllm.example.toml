@@ -63,6 +63,16 @@ timeout_seconds = 600
 # Emits Anthropic ping events or OpenAI SSE comments; does not extend the timeout.
 keep_alive_seconds = 10
 
+# Maps a client model ID onto a configured provider/model. Clients that hardcode
+# an Anthropic name reach a real model instead of an unknown-model error; an ID
+# that already names a provider is left alone. Each target must be
+# provider/native-model-id with a provider configured below. Keep this table
+# last in [server]: TOML puts every key after it inside the map.
+# [server.model_aliases]
+# "claude-sonnet-4-6" = "openai/gpt-5.6-sol"
+# "claude-haiku-4-5" = "openai/gpt-5.6-luna"
+# haiku = "openai/gpt-5.6-luna"
+
 [logging]
 # tracing target filter on stderr. Default: tinyllm=info; dependencies stay quiet.
 # Examples: tinyllm=debug, warn,tinyllm=debug, off. Default logs omit prompt bodies
@@ -125,6 +135,12 @@ type = "Subscription"
 # levels for the selected model and reject unsupported controls. Omit this field
 # to leave effort to the client/provider; levels are not exact token budgets.
 reasoning_effort = "medium"
+
+# Ceiling applied after the client's choice, using the same values. A default
+# alone cannot bring effort down, because Claude Code asks for high on every
+# turn; this lowers such a request and never raises a smaller one. Omitted: the
+# client's choice stands.
+# max_reasoning_effort = "low"
 
 # Optional OpenAI service tier; omitted leaves the client's/upstream's choice.
 # Values: auto, default, flex, priority, fast, ultrafast. Fast is sent as priority.

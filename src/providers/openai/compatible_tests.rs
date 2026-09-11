@@ -6,6 +6,7 @@ fn model() -> super::super::models::Model {
     super::super::models::Model {
         id: "gpt-native".into(),
         reasoning_effort: Some(ReasoningEffort::High),
+        max_reasoning_effort: None,
     }
 }
 

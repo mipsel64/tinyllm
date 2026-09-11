@@ -79,6 +79,7 @@ fn model() -> Model {
     Model {
         id: "gpt-test".into(),
         reasoning_effort: Some(ReasoningEffort::Medium),
+        max_reasoning_effort: None,
     }
 }
 
@@ -802,6 +803,7 @@ fn model_switch_carriers_replay_text_and_tool_only_history() {
                 &Model {
                     id: "gpt-5.6-terra".into(),
                     reasoning_effort: None,
+                    max_reasoning_effort: None,
                 },
             )
             .unwrap();
@@ -2644,6 +2646,229 @@ async fn auto_review_subrequests_reach_the_configured_reviewer() {
     let _ = tokio::fs::remove_dir_all(directory).await;
 }
 
+#[tokio::test]
+async fn streamed_read_arguments_are_repaired_before_the_client_sees_them() {
+    let call = json!({"type":"function_call","id":"f","call_id":"call_r","name":"Read",
+                      "arguments":"{\"file_path\":\"/tmp/a\",\"pages\":\"\"}","status":"completed"});
+    let events = vec![
+        json!({"type":"response.created","response":{"id":"resp_test"}}),
+        json!({"type":"response.output_item.added","output_index":0,
+               "item":{"id":"f","type":"function_call","call_id":"call_r","name":"Read","arguments":""}}),
+        // The model streams the meaningless argument in fragments.
+        json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"f",
+               "delta":"{\"file_path\":\"/tmp/a\","}),
+        json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"f",
+               "delta":"\"pages\":\"\"}"}),
+        json!({"type":"response.function_call_arguments.done","output_index":0,"item_id":"f",
+               "arguments":"{\"file_path\":\"/tmp/a\",\"pages\":\"\"}"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":call}),
+        json!({"type":"response.completed","response":upstream_response(json!([call]))}),
+    ];
+    let mut translator = stream::Translator::new("openai/gpt-test".into());
+    let mut out = Vec::new();
+    let mut deltas_before_done = 0;
+    for event in &events {
+        for emitted in translator.accept(event).unwrap() {
+            let value = serde_json::to_value(&emitted).unwrap();
+            if value["type"] == "content_block_delta"
+                && event["type"] == "response.function_call_arguments.delta"
+            {
+                deltas_before_done += 1;
+            }
+            out.push(value);
+        }
+    }
+    assert_eq!(
+        deltas_before_done, 0,
+        "tool arguments must not stream out before they can be repaired"
+    );
+    let json: String = out
+        .iter()
+        .filter(|e| e["type"] == "content_block_delta")
+        .map(|e| e["delta"]["partial_json"].as_str().unwrap())
+        .collect();
+    let input: Value = serde_json::from_str(&json).unwrap();
+    assert!(input.get("pages").is_none(), "{input}");
+    assert_eq!(input["file_path"], "/tmp/a");
+
+    // The accumulated response agrees with what was streamed.
+    let native = translator.completed.take().unwrap();
+    let response = protocol::response(&native, "openai/gpt-test").unwrap();
+    let serde_json::Value::Object(_) = serde_json::to_value(&response.content).unwrap()[0].clone()
+    else {
+        panic!("expected a content block")
+    };
+    let content = serde_json::to_value(&response.content).unwrap();
+    assert_eq!(content[0]["name"], "Read");
+    assert!(content[0]["input"].get("pages").is_none(), "{content}");
+}
+
+#[test]
+fn an_empty_completion_is_an_error_not_a_silent_empty_turn() {
+    // Claude Code would render a success with no content as the model saying
+    // nothing, and would not retry it.
+    for output in [
+        json!([]),
+        json!([{"type":"reasoning","id":"rs","summary":[],"encrypted_content":"opaque"}]),
+    ] {
+        let native = upstream_response(output.clone());
+        let error = protocol::response(&native, "openai/gpt-test").unwrap_err();
+        assert_eq!(error.status, 502, "{output}");
+        assert!(error.message.contains("without any text or tool call"));
+    }
+    // Truncation is a real outcome and keeps its own stop reason.
+    let mut truncated = upstream_response(json!([]));
+    truncated["status"] = json!("incomplete");
+    truncated["incomplete_details"] = json!({"reason":"max_output_tokens"});
+    let response = protocol::response(&truncated, "openai/gpt-test").unwrap();
+    assert_eq!(response.stop_reason.as_deref(), Some("max_tokens"));
+    // Anything usable still passes.
+    let usable = upstream_response(
+        json!([{"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"hi","annotations":[]}]}]),
+    );
+    assert!(protocol::response(&usable, "openai/gpt-test").is_ok());
+}
+
+#[test]
+fn configured_ceiling_lowers_client_effort_but_never_raises_it() {
+    let capped = |ceiling: Option<ReasoningEffort>, asked: Option<&str>| {
+        let model = Model {
+            id: "gpt-test".into(),
+            reasoning_effort: None,
+            max_reasoning_effort: ceiling,
+        };
+        let mut req = request();
+        if let Some(asked) = asked {
+            req["output_config"] = json!({"effort": asked});
+        }
+        protocol::request(&req, &model).unwrap()["reasoning"]["effort"].clone()
+    };
+
+    // Claude Code asks for high on every turn, so a ceiling has to win.
+    assert_eq!(capped(Some(ReasoningEffort::Low), Some("high")), "low");
+    assert_eq!(capped(Some(ReasoningEffort::Low), Some("max")), "low");
+    // It is a ceiling, not a setting: a smaller ask survives untouched.
+    assert_eq!(capped(Some(ReasoningEffort::High), Some("low")), "low");
+    assert_eq!(capped(Some(ReasoningEffort::Low), Some("none")), "none");
+    // With no ask at all the ceiling is stated, so an upstream default cannot
+    // silently exceed it.
+    assert_eq!(capped(Some(ReasoningEffort::Low), None), "low");
+    // Unset ceiling changes nothing.
+    assert_eq!(capped(None, Some("high")), "high");
+    assert_eq!(capped(None, None), Value::Null);
+}
+
+#[tokio::test]
+async fn model_aliases_route_hardcoded_client_names() {
+    use axum::{Json, Router, routing::post};
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (upstream, up_task) = serve(Router::new().route(
+        "/responses",
+        post({
+            let seen = seen.clone();
+            move |Json(req): Json<Value>| {
+                seen.lock().unwrap().push(req["model"].as_str().unwrap_or_default().to_owned());
+                async move {
+                    Json(upstream_response(
+                        json!([{"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}]}]),
+                    ))
+                }
+            }
+        }),
+    ))
+    .await;
+    let directory = std::env::temp_dir().join(format!("tinyllm-alias-{}", uuid::Uuid::new_v4()));
+    let mut cfg = config(upstream, directory.clone());
+    cfg.server.model_aliases = [
+        (
+            "claude-sonnet-4-6".to_string(),
+            "openai/gpt-test".to_string(),
+        ),
+        ("haiku".to_string(), "openai/gpt-test".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let (gateway, task) = serve(crate::server::router(cfg).await.unwrap()).await;
+    let send = |model: &str| {
+        let url = format!("{gateway}/anthropic/v1/messages");
+        let mut body = request();
+        body["model"] = json!(model);
+        async move {
+            reqwest::Client::new()
+                .post(&url)
+                .bearer_auth("local-secret")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // Names that would otherwise be unknown-model errors now route.
+    assert_eq!(send("claude-sonnet-4-6").await, 200);
+    assert_eq!(send("haiku").await, 200);
+    // An explicit provider/model is untouched, and an unaliased name still fails.
+    assert_eq!(send("openai/gpt-test").await, 200);
+    assert_eq!(send("claude-opus-4-7").await, 400);
+    task.abort();
+    up_task.abort();
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        3,
+        "the unaliased name never dispatched"
+    );
+    let _ = tokio::fs::remove_dir_all(directory).await;
+}
+
+#[tokio::test]
+async fn count_tokens_answers_locally_without_an_upstream() {
+    // The upstream refuses every connection: a count must never need one.
+    let directory = std::env::temp_dir().join(format!("tinyllm-count-{}", uuid::Uuid::new_v4()));
+    let cfg = config("http://127.0.0.1:1".into(), directory.clone());
+    let (gateway, task) = serve(crate::server::router(cfg).await.unwrap()).await;
+    let url = format!("{gateway}/anthropic/v1/messages/count_tokens");
+    let count = |body: Value| {
+        let url = url.clone();
+        async move {
+            let response = reqwest::Client::new()
+                .post(&url)
+                .bearer_auth("local-secret")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, response.json::<Value>().await.unwrap())
+        }
+    };
+
+    let (status, small) = count(request()).await;
+    assert_eq!(status, 200, "{small}");
+    let small = small["input_tokens"].as_u64().unwrap();
+    assert!(small > 0);
+
+    let mut big = request();
+    big["messages"] = json!([{"role":"user","content":"token ".repeat(2000)}]);
+    let (_, big) = count(big).await;
+    let big = big["input_tokens"].as_u64().unwrap();
+    assert!(big > small * 20, "big={big} small={small}");
+
+    // Input we cannot read is rejected rather than answered with a wrong number
+    // that the client would trust as a context size.
+    for malformed in [
+        json!({"messages":"not a list"}),
+        json!({"model":"openai/gpt-test","messages":"not a list"}),
+        json!({"model":42,"messages":[]}),
+    ] {
+        let (status, body) = count(malformed.clone()).await;
+        assert_eq!(status, 400, "{malformed}");
+        assert!(body.get("input_tokens").is_none(), "{malformed}");
+    }
+    task.abort();
+    let _ = tokio::fs::remove_dir_all(directory).await;
+}
+
 #[test]
 fn auto_review_detection_needs_all_three_signals() {
     use crate::models::request::RequestBody;
@@ -2977,6 +3202,7 @@ async fn openai_model_defaults_and_client_overrides_reach_each_endpoint() {
         ModelOptions {
             reasoning_effort: Some(ReasoningEffort::Max),
             service_tier: Some(ServiceTier::Priority),
+            ..Default::default()
         },
     );
     let (gateway, task) = serve(crate::server::router(cfg).await.unwrap()).await;

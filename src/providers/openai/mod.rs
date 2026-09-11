@@ -5,6 +5,7 @@ pub mod protocol;
 pub mod reasoning;
 mod stop;
 pub mod stream;
+pub mod tool_args;
 
 use self::{
     auth::Auth,
@@ -54,13 +55,11 @@ impl OpenAiProvider {
 
     fn model(&self, native: &str) -> Model {
         let configured = self.synthetic_fast_base(native).unwrap_or(native);
+        let options = self.config.models.get(configured);
         Model {
             id: native.into(),
-            reasoning_effort: self
-                .config
-                .models
-                .get(configured)
-                .and_then(|m| m.reasoning_effort),
+            reasoning_effort: options.and_then(|m| m.reasoning_effort),
+            max_reasoning_effort: options.and_then(|m| m.max_reasoning_effort),
         }
     }
 

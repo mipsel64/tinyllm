@@ -105,15 +105,33 @@ impl Block {
                 "completed content differs from streamed deltas",
             ));
         }
-        if matches!(self.start, ContentBlockStart::ToolUse { .. })
-            && !serde_json::from_str::<Value>(expected).is_ok_and(|v| v.is_object())
-        {
-            return Err(Error::upstream(
-                "upstream returned invalid tool argument JSON",
-            ));
+        if let ContentBlockStart::ToolUse { name, .. } = &self.start {
+            if !serde_json::from_str::<Value>(expected).is_ok_and(|v| v.is_object()) {
+                return Err(Error::upstream(
+                    "upstream returned invalid tool argument JSON",
+                ));
+            }
+            // Arguments are buffered until here, so a repair still reaches the
+            // client as the only version of the call it ever sees. `text` stays
+            // as streamed: upstream repeats these arguments on item completion
+            // and they must still match.
+            if !self.done
+                && let Some(repaired) = super::tool_args::sanitize(name, expected)
+            {
+                self.deltas.clear();
+                self.deltas.push_back(Delta::InputJson {
+                    partial_json: repaired,
+                });
+            }
         }
         self.done = true;
         Ok(())
+    }
+
+    /// Tool arguments are only actionable once complete, and holding them lets
+    /// them be repaired before the client sees a call it would reject.
+    fn buffered(&self) -> bool {
+        !self.done && matches!(self.start, ContentBlockStart::ToolUse { .. })
     }
 }
 
@@ -485,6 +503,9 @@ impl Translator {
                     });
                     index
                 });
+                if block.buffered() {
+                    return;
+                }
                 events.extend(
                     block
                         .deltas

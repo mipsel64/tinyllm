@@ -19,6 +19,9 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct ModelOptions {
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Ceiling applied after the client's choice. Claude Code asks for high on
+    /// every turn, so a default alone cannot bring a model's effort down.
+    pub max_reasoning_effort: Option<ReasoningEffort>,
     pub service_tier: Option<ServiceTier>,
 }
 
@@ -86,4 +89,18 @@ pub struct Model {
     #[serde(default)]
     pub id: String,
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub max_reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl Model {
+    /// Lowers a requested effort to the configured ceiling, never raising it.
+    /// Every API surface routes its effort through here, so a ceiling cannot be
+    /// escaped by asking on a different endpoint.
+    pub fn cap_effort<'a>(&self, requested: &'a str) -> &'a str {
+        match (self.max_reasoning_effort, ReasoningEffort::parse(requested)) {
+            (Some(ceiling), Some(asked)) if asked > ceiling => ceiling.as_str(),
+            _ => requested,
+        }
+    }
 }

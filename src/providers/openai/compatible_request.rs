@@ -66,6 +66,20 @@ pub fn native(mut body: Value, model: &Model, subscription: bool) -> Result<Valu
             reasoning.entry("effort").or_insert(json!(effort));
         }
     }
+    // Indexing a Map panics on a missing key, and reasoning is often absent.
+    let asked = object
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(asked) = asked {
+        let capped = model.cap_effort(&asked).to_owned();
+        if capped != asked
+            && let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut)
+        {
+            reasoning.insert("effort".into(), json!(capped));
+        }
+    }
     Ok(body)
 }
 
@@ -329,7 +343,10 @@ pub fn chat(request: &Value, model: &Model, subscription: bool) -> Result<Value>
         if !effort.is_null() && !effort.is_string() {
             return Err(Error::invalid("reasoning_effort must be a string"));
         }
-        output["reasoning"] = json!({"effort":effort});
+        output["reasoning"] = match effort.as_str() {
+            Some(asked) => json!({"effort": model.cap_effort(asked)}),
+            None => json!({"effort": effort}),
+        };
     }
     if let Some(format) = request.get("response_format").filter(|v| !v.is_null()) {
         let converted = match protocol::string(format, "type")? {

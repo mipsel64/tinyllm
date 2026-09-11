@@ -10,7 +10,6 @@ use crate::{
 use axum::{
     Json, Router,
     extract::{Request, State},
-    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -26,10 +25,7 @@ impl Endpoint for AnthropicEndpoint {
         Router::new()
             .route(HELLO_PATH, get(hello))
             .route("/anthropic/v1/messages", post(messages))
-            .route(
-                "/anthropic/v1/messages/count_tokens",
-                post(count_tokens_unavailable),
-            )
+            .route("/anthropic/v1/messages/count_tokens", post(count_tokens))
             .route("/anthropic/v1/models", get(models))
     }
 }
@@ -39,15 +35,36 @@ async fn hello() -> Json<serde_json::Value> {
 async fn messages(State(app): State<Arc<AppState>>, request: Request) -> Response {
     endpoint::execute(app, request, ApiFormat::Anthropic).await
 }
-async fn count_tokens_unavailable() -> Response {
-    let error = Error {
-        status: StatusCode::NOT_FOUND,
-        kind: "not_found_error",
-        message: "token counting is not supported; use client-side context estimation".into(),
-        headers: Box::default(),
+/// Answered locally: Claude Code decides when to compact from this, and a
+/// round trip per estimate would cost more than the estimate is worth.
+async fn count_tokens(State(app): State<Arc<AppState>>, request: Request) -> Response {
+    let fail = |error: Error| {
+        tracing::warn!(error = ?error, "request failed");
+        (error.status, Json(error.json())).into_response()
     };
-    tracing::debug!(error = ?error, "optional token counting is unavailable");
-    (error.status, Json(error.json())).into_response()
+    // Shares the deadline and size limit with inference: this route accepts a
+    // whole conversation, so it must not be the one that stalls.
+    let value = match endpoint::read_body(&app, request).await {
+        Ok(value) => value,
+        Err(error) => return fail(error),
+    };
+    let Ok(body) = serde_json::from_value::<crate::models::request::RequestBody>(value) else {
+        return fail(Error::invalid(
+            "count_tokens requires a string model and message list",
+        ));
+    };
+    // A count derived from input we could not read would be trusted as a context
+    // size, so refuse rather than answer with a number that means nothing.
+    if body
+        .fields
+        .get("messages")
+        .is_some_and(|messages| !messages.is_array())
+    {
+        return fail(Error::invalid("count_tokens messages must be an array"));
+    }
+    let input_tokens = super::count_tokens::count(&body);
+    tracing::debug!(input_tokens, model = %body.model, "estimated input tokens");
+    Json(serde_json::json!({ "input_tokens": input_tokens })).into_response()
 }
 async fn models(State(app): State<Arc<AppState>>) -> Json<ModelsListResponse> {
     let data: Vec<_> = app
