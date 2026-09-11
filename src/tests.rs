@@ -2088,19 +2088,27 @@ async fn http_errors_preserve_upstream_status_retry_and_type() {
 #[tokio::test]
 async fn http_discovery_and_model_names_use_provider_prefixes() {
     let fixture = http_fixture("openai", Some("local-secret")).await;
-    assert_eq!(
-        fixture
+    for path in ["/anthropic/v1/models", "/v1/models"] {
+        let models = fixture
             .client
-            .get(format!("{}/anthropic/v1/models", fixture.gateway))
+            .get(format!("{}{path}", fixture.gateway))
             .bearer_auth("local-secret")
             .send()
             .await
             .unwrap()
             .json::<Value>()
             .await
-            .unwrap()["data"][0]["id"],
-        "openai/gpt-test"
-    );
+            .unwrap();
+        assert_eq!(
+            models["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|model| model["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["openai/gpt-test", "openai/gpt-test-fast"]
+        );
+    }
     for model in [
         "gpt-test",
         "main",
@@ -2843,11 +2851,13 @@ async fn openai_model_defaults_and_client_overrides_reach_each_endpoint() {
         ("/v1/chat/completions", ""),
         ("/v1/responses", "reasoning"),
     ] {
-        for (model, effort, expected) in [
-            ("gpt-5.6-sol", Some("max"), "max"),
-            ("gpt-5.4", Some("max"), "xhigh"),
-            ("gpt-5.4", Some("low"), "low"),
-            ("gpt-5.4", None, "xhigh"),
+        for (model, native_model, effort, expected) in [
+            ("gpt-5.6-sol", "gpt-5.6-sol", Some("max"), "max"),
+            ("gpt-5.4", "gpt-5.4", Some("max"), "xhigh"),
+            ("gpt-5.4", "gpt-5.4", Some("low"), "low"),
+            ("gpt-5.4", "gpt-5.4", None, "xhigh"),
+            ("gpt-5.4-fast", "gpt-5.4", None, "xhigh"),
+            ("gpt-9-fast", "gpt-9-fast", Some("low"), "low"),
         ] {
             let mut body = if path.ends_with("/responses") {
                 json!({"input":"hello"})
@@ -2858,6 +2868,13 @@ async fn openai_model_defaults_and_client_overrides_reach_each_endpoint() {
             if path.starts_with("/anthropic") {
                 body["max_tokens"] = json!(32);
                 body["thinking"] = json!({"type":"adaptive"});
+            }
+            if model.ends_with("-fast") {
+                body["service_tier"] = if path.starts_with("/anthropic") {
+                    json!("standard_only")
+                } else {
+                    json!("flex")
+                };
             }
             if let Some(effort) = effort {
                 if container.is_empty() {
@@ -2873,25 +2890,28 @@ async fn openai_model_defaults_and_client_overrides_reach_each_endpoint() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(
-                response.status(),
-                200,
-                "{path} {model}: {}",
-                response.text().await.unwrap()
-            );
+            let status = response.status();
+            let response = response.json::<Value>().await.unwrap();
+            assert_eq!(status, 200, "{path} {model}: {response}");
             let upstream = receiver.recv().await.unwrap();
-            assert_eq!(upstream["model"], model);
+            assert_eq!(upstream["model"], native_model);
             assert_eq!(upstream["reasoning"]["effort"], expected);
+            assert_eq!(response["model"], format!("openai/{model}"));
             if !path.starts_with("/anthropic") {
-                assert_eq!(
-                    response.json::<Value>().await.unwrap()["service_tier"],
-                    "default"
-                );
+                assert_eq!(response["service_tier"], "default");
             }
-            if model == "gpt-5.4" {
-                assert_eq!(upstream["service_tier"], "priority");
-            } else {
-                assert!(upstream.get("service_tier").is_none());
+            match native_model {
+                "gpt-5.4" => assert_eq!(upstream["service_tier"], "priority"),
+                // An unconfigured base forwards the name literally and keeps the client tier.
+                "gpt-9-fast" => assert_eq!(
+                    upstream["service_tier"],
+                    if path.starts_with("/anthropic") {
+                        "default"
+                    } else {
+                        "flex"
+                    }
+                ),
+                _ => assert!(upstream.get("service_tier").is_none()),
             }
         }
         let tiers = if path.starts_with("/anthropic") {
