@@ -9,11 +9,10 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{Request, State, rejection::JsonRejection},
+    extract::{Request, State},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde_json::Value;
 use std::sync::Arc;
 
 /// Claude Code warms its connection pool against this before the first real
@@ -38,18 +37,31 @@ async fn messages(State(app): State<Arc<AppState>>, request: Request) -> Respons
 }
 /// Answered locally: Claude Code decides when to compact from this, and a
 /// round trip per estimate would cost more than the estimate is worth.
-async fn count_tokens(body: Result<Json<Value>, JsonRejection>) -> Response {
-    let rejected = |message: &'static str| {
-        let error = Error::invalid(message);
+async fn count_tokens(State(app): State<Arc<AppState>>, request: Request) -> Response {
+    let fail = |error: Error| {
         tracing::warn!(error = ?error, "request failed");
         (error.status, Json(error.json())).into_response()
     };
-    let Ok(Json(value)) = body else {
-        return rejected("count_tokens requires a JSON request body");
+    // Shares the deadline and size limit with inference: this route accepts a
+    // whole conversation, so it must not be the one that stalls.
+    let value = match endpoint::read_body(&app, request).await {
+        Ok(value) => value,
+        Err(error) => return fail(error),
     };
     let Ok(body) = serde_json::from_value::<crate::models::request::RequestBody>(value) else {
-        return rejected("count_tokens requires a string model and message list");
+        return fail(Error::invalid(
+            "count_tokens requires a string model and message list",
+        ));
     };
+    // A count derived from input we could not read would be trusted as a context
+    // size, so refuse rather than answer with a number that means nothing.
+    if body
+        .fields
+        .get("messages")
+        .is_some_and(|messages| !messages.is_array())
+    {
+        return fail(Error::invalid("count_tokens messages must be an array"));
+    }
     let input_tokens = super::count_tokens::count(&body);
     tracing::debug!(input_tokens, model = %body.model, "estimated input tokens");
     Json(serde_json::json!({ "input_tokens": input_tokens })).into_response()

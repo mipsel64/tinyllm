@@ -1,14 +1,11 @@
 //! Repairs tool arguments a model emits that the client would reject.
 //!
 //! Claude Code validates tool input against its own schema and fails the call
-//! when it does not fit. Two shapes recur with `Read` and cost a turn each, so
-//! they are dropped here rather than bounced back through the model.
+//! when it does not fit, costing a turn. Only arguments that carry no meaning at
+//! all are dropped: anything the schema would accept is forwarded untouched,
+//! because silently changing a valid argument is worse than a visible error.
 
 use serde_json::Value;
-
-/// Past this an offset is a hallucinated line number rather than a real one;
-/// dropping it reads the file from the start instead of failing the call.
-const ABSURD_OFFSET: i64 = 1_000_000;
 
 /// Returns the repaired arguments, or None when nothing needed changing.
 pub fn sanitize(name: &str, arguments: &str) -> Option<String> {
@@ -18,32 +15,19 @@ pub fn sanitize(name: &str, arguments: &str) -> Option<String> {
     let mut parsed: Value = serde_json::from_str(arguments).ok()?;
     let object = parsed.as_object_mut()?;
 
-    // `pages` is meaningful only for PDFs; empty means the model filled a field
-    // it should have omitted.
-    let empty_pages = object
+    // `pages` selects PDF pages, so an empty string selects nothing: the model
+    // filled a field it should have omitted. No page range means the same thing,
+    // so removing it cannot change which pages are read.
+    if !object
         .get("pages")
         .and_then(Value::as_str)
-        .is_some_and(str::is_empty);
-    let absurd_offset = object
-        .get("offset")
-        .and_then(Value::as_i64)
-        .is_some_and(|offset| offset >= ABSURD_OFFSET);
-    if !empty_pages && !absurd_offset {
+        .is_some_and(str::is_empty)
+    {
         return None;
     }
-    if empty_pages {
-        object.remove("pages");
-    }
-    if absurd_offset {
-        object.remove("offset");
-    }
+    object.remove("pages");
     let repaired = serde_json::to_string(&parsed).ok()?;
-    tracing::debug!(
-        tool = name,
-        empty_pages,
-        absurd_offset,
-        "repaired tool arguments"
-    );
+    tracing::debug!(tool = name, "dropped an empty pages argument");
     Some(repaired)
 }
 
@@ -52,24 +36,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drops_empty_pages_and_absurd_offsets_keeping_the_rest() {
+    fn drops_an_empty_pages_argument_keeping_the_rest() {
         let repaired = sanitize("Read", r#"{"file_path":"/tmp/a","pages":"","limit":20}"#).unwrap();
         let value: Value = serde_json::from_str(&repaired).unwrap();
         assert!(value.get("pages").is_none());
         assert_eq!(value["file_path"], "/tmp/a");
         assert_eq!(value["limit"], 20);
-
-        let repaired = sanitize("Read", r#"{"file_path":"/tmp/a","offset":1300000}"#).unwrap();
-        let value: Value = serde_json::from_str(&repaired).unwrap();
-        assert!(value.get("offset").is_none());
     }
 
     #[test]
-    fn leaves_usable_arguments_alone() {
+    fn never_rewrites_an_argument_the_schema_would_accept() {
         for arguments in [
-            r#"{"file_path":"/tmp/a","offset":1300,"limit":20}"#,
             r#"{"file_path":"/tmp/a","pages":"1-5"}"#,
             r#"{"file_path":"/tmp/a"}"#,
+            // A large offset is unusual but legal, and quietly dropping it would
+            // read different lines than the call asked for.
+            r#"{"file_path":"/tmp/a","offset":1000000}"#,
+            r#"{"file_path":"/tmp/a","offset":1300000,"limit":20}"#,
+            r#"{"file_path":"/tmp/a","offset":1300,"limit":20}"#,
         ] {
             assert_eq!(sanitize("Read", arguments), None, "{arguments}");
         }
@@ -77,8 +61,8 @@ mod tests {
 
     #[test]
     fn touches_nothing_else() {
-        // Another tool may use these names with its own meaning.
-        assert_eq!(sanitize("Grep", r#"{"pages":"","offset":9999999}"#), None);
+        // Another tool may use this name with its own meaning.
+        assert_eq!(sanitize("Grep", r#"{"pages":""}"#), None);
         assert_eq!(sanitize("Read", ""), None);
         assert_eq!(sanitize("Read", "not json"), None);
         assert_eq!(sanitize("Read", "[1,2]"), None);

@@ -2649,18 +2649,18 @@ async fn auto_review_subrequests_reach_the_configured_reviewer() {
 #[tokio::test]
 async fn streamed_read_arguments_are_repaired_before_the_client_sees_them() {
     let call = json!({"type":"function_call","id":"f","call_id":"call_r","name":"Read",
-                      "arguments":"{\"file_path\":\"/tmp/a\",\"offset\":1300000}","status":"completed"});
+                      "arguments":"{\"file_path\":\"/tmp/a\",\"pages\":\"\"}","status":"completed"});
     let events = vec![
         json!({"type":"response.created","response":{"id":"resp_test"}}),
         json!({"type":"response.output_item.added","output_index":0,
                "item":{"id":"f","type":"function_call","call_id":"call_r","name":"Read","arguments":""}}),
-        // The model streams the bad offset in fragments.
+        // The model streams the meaningless argument in fragments.
         json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"f",
                "delta":"{\"file_path\":\"/tmp/a\","}),
         json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"f",
-               "delta":"\"offset\":1300000}"}),
+               "delta":"\"pages\":\"\"}"}),
         json!({"type":"response.function_call_arguments.done","output_index":0,"item_id":"f",
-               "arguments":"{\"file_path\":\"/tmp/a\",\"offset\":1300000}"}),
+               "arguments":"{\"file_path\":\"/tmp/a\",\"pages\":\"\"}"}),
         json!({"type":"response.output_item.done","output_index":0,"item":call}),
         json!({"type":"response.completed","response":upstream_response(json!([call]))}),
     ];
@@ -2688,7 +2688,7 @@ async fn streamed_read_arguments_are_repaired_before_the_client_sees_them() {
         .map(|e| e["delta"]["partial_json"].as_str().unwrap())
         .collect();
     let input: Value = serde_json::from_str(&json).unwrap();
-    assert!(input.get("offset").is_none(), "{input}");
+    assert!(input.get("pages").is_none(), "{input}");
     assert_eq!(input["file_path"], "/tmp/a");
 
     // The accumulated response agrees with what was streamed.
@@ -2700,7 +2700,7 @@ async fn streamed_read_arguments_are_repaired_before_the_client_sees_them() {
     };
     let content = serde_json::to_value(&response.content).unwrap();
     assert_eq!(content[0]["name"], "Read");
-    assert!(content[0]["input"].get("offset").is_none(), "{content}");
+    assert!(content[0]["input"].get("pages").is_none(), "{content}");
 }
 
 #[test]
@@ -2854,10 +2854,17 @@ async fn count_tokens_answers_locally_without_an_upstream() {
     let big = big["input_tokens"].as_u64().unwrap();
     assert!(big > small * 20, "big={big} small={small}");
 
-    // Malformed input is rejected rather than answered with a wrong number.
-    let (status, body) = count(json!({"messages":"not a list"})).await;
-    assert_eq!(status, 400);
-    assert!(body.get("input_tokens").is_none());
+    // Input we cannot read is rejected rather than answered with a wrong number
+    // that the client would trust as a context size.
+    for malformed in [
+        json!({"messages":"not a list"}),
+        json!({"model":"openai/gpt-test","messages":"not a list"}),
+        json!({"model":42,"messages":[]}),
+    ] {
+        let (status, body) = count(malformed.clone()).await;
+        assert_eq!(status, 400, "{malformed}");
+        assert!(body.get("input_tokens").is_none(), "{malformed}");
+    }
     task.abort();
     let _ = tokio::fs::remove_dir_all(directory).await;
 }

@@ -225,12 +225,14 @@ mod tests {
                 "endpoint not implemented",
             ),
             (
+                // Shares body handling with inference, so a bodiless upload is
+                // refused the same way on both.
                 "/anthropic/v1/messages/count_tokens",
                 "fixture-local-secret",
-                400,
+                415,
                 "WARN",
                 "invalid_request_error",
-                "count_tokens requires a JSON request body",
+                "invalid JSON request",
             ),
             (
                 "/anthropic/v1/messages/count_tokens/unknown",

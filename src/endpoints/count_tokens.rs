@@ -6,6 +6,7 @@
 
 use crate::models::request::RequestBody;
 use serde_json::Value;
+use std::collections::HashSet;
 use tiktoken_rs::o200k_base_singleton;
 
 /// Per-message and per-content-part framing the wire format adds around text.
@@ -27,6 +28,7 @@ pub fn count(body: &RequestBody) -> u64 {
     {
         total += MESSAGE_OVERHEAD + content_tokens(&message["content"]);
     }
+    let loaded = loaded_tools(body);
     for tool in body
         .fields
         .get("tools")
@@ -34,10 +36,35 @@ pub fn count(body: &RequestBody) -> u64 {
         .into_iter()
         .flatten()
     {
+        // A deferred tool costs nothing until a tool_reference loads it, so
+        // counting it would report context the model never sees.
+        let deferred = tool["defer_loading"] == true;
+        if deferred
+            && !tool["name"]
+                .as_str()
+                .is_some_and(|name| loaded.contains(name))
+        {
+            continue;
+        }
         // Tool definitions reach the model as serialized schema.
         total += MESSAGE_OVERHEAD + text_tokens(&tool.to_string());
     }
     total.max(1)
+}
+
+/// Names that a `tool_reference` in some tool result has pulled into context.
+/// Mirrors the same rule in the request translator.
+fn loaded_tools(body: &RequestBody) -> HashSet<&str> {
+    body.fields
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .flat_map(|block| block["content"].as_array().into_iter().flatten())
+        .filter(|part| part["type"] == "tool_reference")
+        .filter_map(|part| part["tool_name"].as_str())
+        .collect()
 }
 
 fn content_tokens(content: &Value) -> u64 {

@@ -46,14 +46,6 @@ pub fn blocks(content: &Value) -> Result<Vec<Value>> {
     }
 }
 
-/// Lowers a requested effort to the model's configured ceiling, never raising it.
-/// Returns None when the request already sits at or below the ceiling.
-fn capped(requested: &str, model: &Model) -> Option<&'static str> {
-    let ceiling = model.max_reasoning_effort?;
-    let requested = crate::models::ReasoningEffort::parse(requested)?;
-    (requested > ceiling).then_some(ceiling.as_str())
-}
-
 /// Continuation metadata written on assistant text by pre-carrier builds.
 const LEGACY_REFERENCE_FIELD: &str = "tinyllm_continuation";
 
@@ -455,7 +447,7 @@ pub fn request(req: &Value, model: &Model) -> Result<Value> {
     }
     if let Some(effort) = effort {
         crate::providers::validate_effort(effort)?;
-        out["reasoning"] = json!({"effort":capped(effort, model).unwrap_or(effort)});
+        out["reasoning"] = json!({"effort": model.cap_effort(effort)});
     } else if let Some(ceiling) = model.max_reasoning_effort {
         // No client choice to cap, but an unstated default can still exceed the
         // ceiling upstream, so state it.
@@ -898,11 +890,11 @@ pub fn response(response: &Value, alias: &str) -> Result<AnthropicResponse> {
     // nothing. Fail loudly instead.
     // ponytail: errors rather than retrying; retry upstream if these turn out common.
     if response["status"] == "completed"
-        && !content.iter().any(|block| {
-            matches!(
-                block,
-                ResponseContent::Text { .. } | ResponseContent::ToolUse { .. }
-            )
+        && !content.iter().any(|block| match block {
+            // Empty text is as unusable as no text at all.
+            ResponseContent::Text { text, .. } => !text.is_empty(),
+            ResponseContent::ToolUse { .. } => true,
+            _ => false,
         })
     {
         return Err(Error::upstream(

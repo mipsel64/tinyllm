@@ -36,6 +36,34 @@ fn error_value(error: &Error, format: ApiFormat) -> Value {
     }
 }
 
+/// Reads a JSON body under the configured deadline and size limit. Every route
+/// that accepts an upload goes through here, so none can stall the server by
+/// trickling bytes.
+pub async fn read_body(app: &Arc<AppState>, request: Request) -> crate::Result<Value> {
+    let Json(value) = tokio::time::timeout(
+        Duration::from_secs(app.config.server.request_body_timeout_seconds),
+        Json::<Value>::from_request(request, app),
+    )
+    .await
+    .map_err(|_| Error {
+        status: StatusCode::REQUEST_TIMEOUT,
+        kind: "timeout_error",
+        message: "request body timed out".into(),
+        headers: Box::default(),
+    })?
+    .map_err(|e| Error {
+        status: e.status(),
+        kind: if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            "request_too_large"
+        } else {
+            "invalid_request_error"
+        },
+        message: "invalid JSON request or max_request_bytes exceeded".into(),
+        headers: Box::default(),
+    })?;
+    Ok(value)
+}
+
 pub async fn execute(app: Arc<AppState>, request: Request, format: ApiFormat) -> Response {
     match run(app, request, format).await {
         Ok(response) => response,
@@ -65,27 +93,7 @@ async fn run(app: Arc<AppState>, request: Request, format: ApiFormat) -> crate::
     let mut headers = request.headers().clone();
     headers.remove("authorization");
     headers.remove("x-api-key");
-    let Json(value) = tokio::time::timeout(
-        Duration::from_secs(app.config.server.request_body_timeout_seconds),
-        Json::<Value>::from_request(request, &app),
-    )
-    .await
-    .map_err(|_| Error {
-        status: StatusCode::REQUEST_TIMEOUT,
-        kind: "timeout_error",
-        message: "request body timed out".into(),
-        headers: Box::default(),
-    })?
-    .map_err(|e| Error {
-        status: e.status(),
-        kind: if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            "request_too_large"
-        } else {
-            "invalid_request_error"
-        },
-        message: "invalid JSON request or max_request_bytes exceeded".into(),
-        headers: Box::default(),
-    })?;
+    let value = read_body(&app, request).await?;
     let mut request = ApiRequest::parse(format, value)?;
     // Clients that hardcode an Anthropic model ID reach a configured target
     // instead of an unknown-model error.
