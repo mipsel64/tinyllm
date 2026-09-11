@@ -12,7 +12,7 @@ use self::{
 };
 use crate::{
     Result,
-    config::Server,
+    config::{Server, validate_model},
     error::Error,
     models::{
         ApiEvent, ApiFormat, ApiRequest, ModelInfo, ProviderOutput, RequestContext, ResponseBody,
@@ -42,18 +42,37 @@ impl OpenAiProvider {
         })
     }
 
+    fn synthetic_fast_base<'a>(&self, native: &'a str) -> Option<&'a str> {
+        let base = native
+            .strip_suffix("-fast")
+            .filter(|b| !b.ends_with("-fast"))?;
+        (!self.config.models.contains_key(native)
+            && base.starts_with("gpt-")
+            && self.config.models.contains_key(base))
+        .then_some(base)
+    }
+
     fn model(&self, native: &str) -> Model {
+        let configured = self.synthetic_fast_base(native).unwrap_or(native);
         Model {
             id: native.into(),
             reasoning_effort: self
                 .config
                 .models
-                .get(native)
+                .get(configured)
                 .and_then(|m| m.reasoning_effort),
         }
     }
 
     async fn send(&self, body: &mut Value) -> Result<(reqwest::Response, String)> {
+        let fast_model = body["model"]
+            .as_str()
+            .and_then(|model| self.synthetic_fast_base(model))
+            .map(str::to_owned);
+        if let Some(model) = fast_model {
+            body["model"] = serde_json::json!(model);
+            body["service_tier"] = serde_json::json!("fast");
+        }
         if body.get("service_tier").is_none()
             && let Some(tier) = body["model"]
                 .as_str()
@@ -127,6 +146,16 @@ impl OpenAiProvider {
                 .header("chatgpt-account-id", account)
                 .header("originator", "tinyllm")
                 .header("accept", "text/event-stream");
+            // The Codex backend routes on this hint, which it sends beside the body tier.
+            if body["service_tier"] == "priority"
+                && let Some(model) = body["model"].as_str()
+            {
+                request = request.header(
+                    "x-codex-routing-hint",
+                    HeaderValue::from_str(&format!("model={model};tier=priority"))
+                        .map_err(|_| Error::upstream("invalid upstream model ID"))?,
+                );
+            }
         }
         request.send().await.map_err(|e| {
             Error::upstream(if e.is_timeout() {
@@ -296,6 +325,7 @@ fn reject_citation_controls(native: &Value) -> Result<()> {
 impl Provider for OpenAiProvider {
     fn convert_reasoning_effort(&self, model: &str, effort: &str) -> Result<String> {
         validate_effort(effort)?;
+        let model = self.synthetic_fast_base(model).unwrap_or(model);
         let family = model
             .strip_prefix("gpt-")
             .and_then(|name| name.split('-').next());
@@ -314,9 +344,16 @@ impl Provider for OpenAiProvider {
         self.config
             .models
             .keys()
+            .flat_map(|id| {
+                let fast = format!("{id}-fast");
+                std::iter::once(id.clone()).chain(
+                    (validate_model(&fast).is_ok() && self.synthetic_fast_base(&fast).is_some())
+                        .then_some(fast),
+                )
+            })
             .map(|id| ModelInfo {
-                id: id.clone(),
                 display_name: id.clone(),
+                id,
             })
             .collect()
     }

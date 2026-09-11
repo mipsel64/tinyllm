@@ -299,6 +299,59 @@ fn replayed(details: &Value) -> Value {
     request::chat(&history, &model(), false).unwrap()["input"][0].clone()
 }
 
+#[test]
+fn fast_suffix_resolves_only_configured_gpt_models() {
+    use super::super::models::{Config, ModelOptions, OpenAiAuth};
+    use crate::providers::Provider;
+    let server = crate::config::Server::default();
+    let provider = OpenAiProvider::new(
+        Config {
+            base_url: "https://api.openai.com/v1".into(),
+            auth: OpenAiAuth::ApiKey("fixture-key".into()),
+            organization: None,
+            project: None,
+            models: ["gpt-5.4", "gpt-5.4-fast", "gpt-6-astra", "o4-mini"]
+                .map(|id| (id.to_owned(), ModelOptions::default()))
+                .into(),
+        },
+        http::client(&server).unwrap(),
+        server,
+    )
+    .unwrap();
+    assert_eq!(
+        provider.synthetic_fast_base("gpt-6-astra-fast"),
+        Some("gpt-6-astra")
+    );
+    for native in [
+        "gpt-5.4-fast",      // configured upstream ID stays literal
+        "gpt-5.4-fast-fast", // the suffix never stacks
+        "o4-mini-fast",      // not a gpt- model
+        "gpt-9-fast",        // base is not configured
+        "gpt-6-astra",
+    ] {
+        assert_eq!(provider.synthetic_fast_base(native), None, "{native}");
+    }
+    assert_eq!(
+        provider
+            .models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>(),
+        [
+            "gpt-5.4",
+            "gpt-5.4-fast",
+            "gpt-6-astra",
+            "gpt-6-astra-fast",
+            "o4-mini"
+        ]
+    );
+    assert!(
+        provider
+            .convert_reasoning_effort("gpt-6-astra-fast", "none")
+            .is_err()
+    );
+}
+
 #[tokio::test]
 async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasoning() {
     use super::super::models::{Config, ModelOptions, OpenAiAuth, SubscriptionOptions};
@@ -329,6 +382,10 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
                 assert_eq!(headers["chatgpt-account-id"], "account");
                 assert_eq!(body["stream"], true);
                 assert_eq!(body["service_tier"], "priority");
+                assert_eq!(
+                    headers["x-codex-routing-hint"],
+                    "model=gpt-native;tier=priority"
+                );
                 assert_eq!(body["instructions"], "");
                 assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
                 assert!(body["input"].is_array());

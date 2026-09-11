@@ -105,7 +105,11 @@ type = "Subscription"
 # Model tables are optional: they populate discovery and set request defaults,
 # not an allowlist. Unlisted native IDs are forwarded too. Quote IDs containing
 # dots or slashes. Model availability depends on the upstream account.
-# Clients select the main/small/subagent model; there are no server-side aliases.
+# Clients select the main/small/subagent model; there are no configurable aliases.
+# Each configured native ID beginning with gpt- also exposes a generated -fast
+# name that sends the base model with priority. Exact configured names stay literal,
+# so listing an upstream ID that itself ends in -fast keeps it verbatim; the suffix
+# never stacks.
 [providers.openai.models."gpt-5.6-sol"]
 # Optional fallback when the client omits effort. Client reasoning controls win.
 # Accepted values: none, minimal, low, medium, high, xhigh, max. Providers map
@@ -115,10 +119,12 @@ reasoning_effort = "medium"
 
 # Optional OpenAI service tier; omitted leaves the client's/upstream's choice.
 # Values: auto, default, flex, priority, fast, ultrafast. Fast is sent as priority.
-# Client service_tier wins, including auto or null on OpenAI endpoints;
-# Anthropic standard_only maps to default and overrides this setting.
-# Fast/priority uses higher subscription credits or API pricing. Model/account
-# support is decided upstream; this does not change reasoning effort.
+# Client service_tier wins for the base model, including auto or null on OpenAI
+# endpoints; Anthropic standard_only maps to default and overrides this setting.
+# Selecting the generated -fast model instead forces priority over both defaults
+# and client fields, and adds Codex's routing hint on subscription requests; upstream
+# still decides delivery. Fast/priority uses higher subscription credits or API pricing.
+# Model/account support is decided upstream; this does not change reasoning effort.
 # service_tier = "priority"
 
 # [providers.openai.models."gpt-6-astra"]
