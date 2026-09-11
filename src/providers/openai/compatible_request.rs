@@ -1,9 +1,14 @@
-use super::super::{models::Model, protocol};
+use super::super::{models::Model, protocol, reasoning};
 use crate::{Result, error::Error};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 pub fn native(mut body: Value, model: &Model, subscription: bool) -> Result<Value> {
+    if crate::providers::http::contains_carrier(&body) {
+        return Err(Error::invalid(
+            "tinyllm reasoning carriers cannot be forwarded as native Responses input",
+        ));
+    }
     let object = body
         .as_object_mut()
         .ok_or_else(|| Error::invalid("request must be an object"))?;
@@ -64,7 +69,7 @@ pub fn native(mut body: Value, model: &Model, subscription: bool) -> Result<Valu
     Ok(body)
 }
 
-pub fn continuation(message: &Value) -> Result<Value> {
+fn assistant(message: &Value) -> Result<Vec<Value>> {
     protocol::fields(
         message,
         &[
@@ -76,55 +81,100 @@ pub fn continuation(message: &Value) -> Result<Value> {
             "reasoning_details",
         ],
     )?;
-    if message["role"] != "assistant" {
+    if protocol::string(message, "role")? != "assistant" {
         return Err(Error::invalid(
             "continuation must be in an assistant message",
         ));
     }
-    let details = message["reasoning_details"].as_array().filter(|d| d.len() == 1)
-        .ok_or_else(|| Error::invalid("assistant history requires the unchanged reasoning_details continuation from tinyllm; start a new conversation with a user summary if the client stripped it"))?;
-    protocol::fields(&details[0], &["type", "data"])?;
-    if details[0]["type"] != "tinyllm_continuation" {
-        return Err(Error::invalid("unsupported reasoning_details continuation"));
-    }
-    let reference = protocol::string(&details[0], "data")?;
-    let mut content = message.clone();
-    let content = content.as_object_mut().unwrap();
-    content.remove("reasoning_details");
-    content.retain(|_, value| !value.is_null());
+    let mut items = carrier_items(message)?;
+    let mut normalized = message.clone();
+    let normalized = normalized.as_object_mut().unwrap();
+    normalized.remove("reasoning_details");
+    normalized.retain(|_, value| !value.is_null());
     for key in ["content", "refusal"] {
-        if content.get(key).is_some_and(|value| value == "") {
-            content.remove(key);
+        if normalized.get(key).is_some_and(|value| value == "") {
+            normalized.remove(key);
         }
     }
-    Ok(
-        json!([{"type":"redacted_thinking","data":reference},{"type":"text","text":Value::Object(content.clone()).to_string()}]),
-    )
-}
+    let normalized = Value::Object(normalized.clone());
 
-pub fn history(request: &Value) -> Result<Value> {
-    let messages = request["messages"]
-        .as_array()
-        .ok_or_else(|| Error::invalid("messages must be an array"))?;
-    let history: Result<Vec<_>> = messages
-        .iter()
-        .map(|message| {
-            if message["role"] == "assistant" {
-                Ok(json!({"role":"assistant","content":continuation(message)?}))
-            } else {
-                Ok(json!({"role":"user","content":""}))
+    if let Some(annotations) = normalized.get("annotations") {
+        validate_annotations(annotations)?;
+    }
+    let mut parts = Vec::new();
+    if let Some(value) = normalized.get("content") {
+        parts.extend(content(value, "assistant")?);
+    }
+    if let Some(value) = normalized.get("refusal") {
+        parts.push(json!({
+            "type":"refusal",
+            "refusal":value.as_str().ok_or_else(|| Error::invalid("refusal must be a string"))?
+        }));
+    }
+    if !parts.is_empty() {
+        items.push(json!({"role":"assistant","content":parts}));
+    }
+    if let Some(value) = normalized.get("tool_calls") {
+        for call in value
+            .as_array()
+            .ok_or_else(|| Error::invalid("tool_calls must be an array"))?
+        {
+            protocol::fields(call, &["id", "type", "function"])?;
+            let id = protocol::string(call, "id")?;
+            if id.is_empty() {
+                return Err(Error::invalid("tool call ID must not be empty"));
             }
-        })
-        .collect();
-    Ok(json!({"messages":history?}))
+            if call["type"] != "function" {
+                return Err(Error::invalid("only function tool calls are supported"));
+            }
+            let function = &call["function"];
+            protocol::fields(function, &["name", "arguments"])?;
+            let name = protocol::string(function, "name")?;
+            protocol::valid_name(name)?;
+            let arguments = protocol::string(function, "arguments")?;
+            items.push(json!({
+                "type":"function_call",
+                "call_id":id,
+                "name":name,
+                "arguments":arguments
+            }));
+        }
+    }
+    Ok(items)
 }
 
-pub fn chat(
-    request: &Value,
-    model: &Model,
-    subscription: bool,
-    restored: &BTreeMap<usize, Vec<Value>>,
-) -> Result<Value> {
+/// Decodes every `reasoning_details` carrier into replayable Responses items.
+fn carrier_items(message: &Value) -> Result<Vec<Value>> {
+    let Some(details) = message.get("reasoning_details").filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let details = details
+        .as_array()
+        .ok_or_else(|| Error::invalid("reasoning_details must be an array or null"))?;
+    let mut items = Vec::new();
+    for detail in details {
+        protocol::fields(detail, &["type", "data"])?;
+        if detail["type"] != "tinyllm_continuation" {
+            return Err(Error::invalid("unsupported reasoning_details continuation"));
+        }
+        if let Some(replay) = reasoning::decode(protocol::string(detail, "data")?) {
+            items.push(replay.item());
+        }
+    }
+    Ok(items)
+}
+
+fn validate_annotations(value: &Value) -> Result<()> {
+    let annotations = value
+        .as_array()
+        .ok_or_else(|| Error::invalid("annotations must be an array"))?;
+    if annotations.iter().any(|annotation| !annotation.is_object()) {
+        return Err(Error::invalid("annotations must contain objects"));
+    }
+    Ok(())
+}
+
+pub fn chat(request: &Value, model: &Model, subscription: bool) -> Result<Value> {
     protocol::fields(
         request,
         &[
@@ -193,16 +243,10 @@ pub fn chat(
     let mut input = Vec::new();
     let mut calls = HashSet::new();
     let mut pending = HashSet::new();
-    for (index, message) in messages.iter().enumerate() {
+    for message in messages {
         let role = protocol::string(message, "role")?;
         let items = match role {
-            "assistant" => {
-                continuation(message)?;
-                restored
-                    .get(&index)
-                    .cloned()
-                    .ok_or_else(|| Error::invalid("assistant continuation was not restored"))?
-            }
+            "assistant" => assistant(message)?,
             "system" | "developer" | "user" => {
                 protocol::fields(message, &["role", "content"])?;
                 if !pending.is_empty() {
@@ -210,7 +254,7 @@ pub fn chat(
                         "tool results must follow assistant tool calls",
                     ));
                 }
-                vec![json!({"role":role,"content":content(&message["content"], role == "user")?})]
+                vec![json!({"role":role,"content":content(&message["content"], role)?})]
             }
             "tool" => {
                 protocol::fields(message, &["role", "content", "tool_call_id"])?;
@@ -223,7 +267,7 @@ pub fn chat(
                 let output = if message["content"].is_string() {
                     message["content"].clone()
                 } else {
-                    json!(content(&message["content"], false)?)
+                    json!(content(&message["content"], "tool")?)
                 };
                 vec![json!({"type":"function_call_output","call_id":id,"output":output})]
             }
@@ -332,14 +376,9 @@ pub fn chat(
                 let function = &tool["function"];
                 protocol::fields(function, &["name", "description", "parameters", "strict"])?;
                 let name = protocol::string(function, "name")?;
-                if name.is_empty()
-                    || name.len() > 64
-                    || !name
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-                    || !names.insert(name.to_owned())
-                {
-                    return Err(Error::invalid("invalid or duplicate function name"));
+                protocol::valid_name(name)?;
+                if !names.insert(name.to_owned()) {
+                    return Err(Error::invalid("duplicate function name"));
                 }
                 if function.get("parameters").is_some_and(|p| !p.is_object()) {
                     return Err(Error::invalid("function parameters must be an object"));
@@ -381,9 +420,14 @@ pub fn chat(
     native(output, model, subscription)
 }
 
-fn content(value: &Value, images: bool) -> Result<Vec<Value>> {
+fn content(value: &Value, role: &str) -> Result<Vec<Value>> {
+    let kind = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
     if let Some(text) = value.as_str() {
-        return Ok(vec![json!({"type":"input_text","text":text})]);
+        return Ok(vec![json!({"type":kind,"text":text})]);
     }
     value
         .as_array()
@@ -392,9 +436,13 @@ fn content(value: &Value, images: bool) -> Result<Vec<Value>> {
         .map(|part| match protocol::string(part, "type")? {
             "text" => {
                 protocol::fields(part, &["type", "text"])?;
-                Ok(json!({"type":"input_text","text":protocol::string(part,"text")?}))
+                Ok(json!({"type":kind,"text":protocol::string(part,"text")?}))
             }
-            "image_url" if images => {
+            "refusal" if role == "assistant" => {
+                protocol::fields(part, &["type", "refusal"])?;
+                Ok(json!({"type":"refusal","refusal":protocol::string(part,"refusal")?}))
+            }
+            "image_url" if role == "user" => {
                 protocol::fields(part, &["type", "image_url"])?;
                 protocol::fields(&part["image_url"], &["url", "detail"])?;
                 let url = protocol::string(&part["image_url"], "url")?;

@@ -54,12 +54,16 @@ pub struct Server {
     pub state_dir: PathBuf,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
-    pub max_state_bytes: u64,
-    pub state_cleanup: Option<StateCleanup>,
     pub max_concurrent_requests: Option<usize>,
     pub request_body_timeout_seconds: u64,
     pub timeout_seconds: u64,
     pub keep_alive_seconds: u64,
+    /// Obsolete since continuations became client-carried. Accepted so existing
+    /// configs still start; validation warns and ignores them.
+    #[serde(rename = "max_state_bytes")]
+    pub obsolete_max_state_bytes: Option<serde_json::Value>,
+    #[serde(rename = "state_cleanup")]
+    pub obsolete_state_cleanup: Option<serde_json::Value>,
 }
 
 impl Default for Server {
@@ -70,50 +74,13 @@ impl Default for Server {
             state_dir: default_state_dir(),
             max_request_bytes: 8 * 1024 * 1024,
             max_response_bytes: 32 * 1024 * 1024,
-            max_state_bytes: 256 * 1024 * 1024,
-            state_cleanup: None,
             max_concurrent_requests: None,
             request_body_timeout_seconds: 30,
             timeout_seconds: 600,
             keep_alive_seconds: 10,
+            obsolete_max_state_bytes: None,
+            obsolete_state_cleanup: None,
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct StateCleanup {
-    pub idle_days: u64,
-    pub interval_seconds: u64,
-}
-
-impl Default for StateCleanup {
-    fn default() -> Self {
-        Self {
-            idle_days: 30,
-            interval_seconds: 3600,
-        }
-    }
-}
-
-impl StateCleanup {
-    pub fn retention(self) -> eyre::Result<std::time::Duration> {
-        use std::time::{Duration, Instant, SystemTime};
-        let retention = self.idle_days.checked_mul(86400).map(Duration::from_secs);
-        if self.idle_days == 0
-            || self.interval_seconds == 0
-            || retention
-                .and_then(|d| SystemTime::now().checked_sub(d))
-                .is_none()
-            || Instant::now()
-                .checked_add(Duration::from_secs(self.interval_seconds))
-                .is_none()
-        {
-            eyre::bail!(
-                "state_cleanup idle_days and interval_seconds must be positive, representable durations"
-            );
-        }
-        Ok(retention.unwrap())
     }
 }
 

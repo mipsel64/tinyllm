@@ -3,7 +3,7 @@ use crate::{
     models::ReasoningEffort,
     providers::openai::{
         models::{Model, ModelOptions, OpenAiAuth, ServiceTier, SubscriptionOptions},
-        protocol, state, stream,
+        protocol, stream,
     },
 };
 use serde_json::{Value, json};
@@ -11,31 +11,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-
-#[test]
-fn state_cleanup_config_is_optional_and_validated() {
-    for (policy, valid) in [
-        (None, true),
-        (Some(json!({})), true),
-        (Some(json!({"idle_days":7,"interval_seconds":60})), true),
-        (Some(json!({"idle_days":0})), false),
-        (Some(json!({"interval_seconds":0})), false),
-        (Some(json!({"idle_days":u64::MAX})), false),
-        (Some(json!({"interval_seconds":u64::MAX})), false),
-        (Some(json!({"typo":30})), false),
-    ] {
-        let mut value = json!({"providers":{"openai":{"type":"openai","auth":{"type":"ApiKey","options":"fixture"}}}});
-        if let Some(policy) = &policy {
-            value["server"] = json!({"state_cleanup":policy});
-        }
-        let result = serde_json::from_value::<crate::config::Config>(value);
-        assert_eq!(
-            result.is_ok_and(|c| c.validate().is_ok()),
-            valid,
-            "{policy:?}"
-        );
-    }
-}
 
 #[test]
 fn provider_config_uses_native_model_names() {
@@ -123,7 +98,7 @@ fn web_search_request_maps_parameters_and_subscription_best_effort_cap() {
     }));
     req["tool_choice"] =
         json!({"type":"tool","name":"web_search","disable_parallel_tool_use":true});
-    let out = protocol::request(&req, &model(), &Default::default()).unwrap();
+    let out = protocol::request(&req, &model()).unwrap();
     assert_eq!(out["tools"][0]["type"], "function");
     assert_eq!(
         out["tools"][0]["parameters"],
@@ -160,13 +135,13 @@ fn web_search_request_maps_parameters_and_subscription_best_effort_cap() {
     ] {
         req["tool_choice"] = choice;
         assert_eq!(
-            protocol::request(&req, &model(), &Default::default()).unwrap()["tool_choice"],
+            protocol::request(&req, &model()).unwrap()["tool_choice"],
             expected
         );
     }
     req.as_object_mut().unwrap().remove("tool_choice");
     req["tools"] = json!([{"type":"web_search_20250305","name":"web_search"}]);
-    let out = protocol::request(&req, &model(), &Default::default()).unwrap();
+    let out = protocol::request(&req, &model()).unwrap();
     assert_eq!(out["tools"], json!([{"type":"web_search"}]));
     assert!(out.get("max_tool_calls").is_none());
     assert_eq!(
@@ -175,7 +150,7 @@ fn web_search_request_maps_parameters_and_subscription_best_effort_cap() {
     );
     req["tool_choice"] = json!({"type":"tool","name":"web_search"});
     assert_eq!(
-        protocol::request(&req, &model(), &Default::default()).unwrap()["tool_choice"],
+        protocol::request(&req, &model()).unwrap()["tool_choice"],
         "required"
     );
     req["tools"]
@@ -183,24 +158,24 @@ fn web_search_request_maps_parameters_and_subscription_best_effort_cap() {
         .unwrap()
         .push(json!({"name":"unloaded","input_schema":{"type":"object"},"defer_loading":true}));
     assert_eq!(
-        protocol::request(&req, &model(), &Default::default()).unwrap()["tool_choice"],
+        protocol::request(&req, &model()).unwrap()["tool_choice"],
         "required"
     );
     req["tools"][0]["blocked_domains"] = json!(["example.org"]);
     assert_eq!(
-        protocol::request(&req, &model(), &Default::default()).unwrap()["tools"][0]["filters"],
+        protocol::request(&req, &model()).unwrap()["tools"][0]["filters"],
         json!({"blocked_domains":["example.org"]})
     );
     req["tools"][0]["blocked_domains"] = json!([]);
     req["tools"][0]["allowed_domains"] = json!([]);
     req["stop_sequences"] = json!([]);
-    assert!(protocol::request(&req, &model(), &Default::default()).is_ok());
+    assert!(protocol::request(&req, &model()).is_ok());
     req["tools"][0]["allowed_domains"] = json!(
         (0..100)
             .map(|i| format!("site{i}.example.org"))
             .collect::<Vec<_>>()
     );
-    assert!(protocol::request(&req, &model(), &Default::default()).is_ok());
+    assert!(protocol::request(&req, &model()).is_ok());
 }
 
 #[test]
@@ -245,16 +220,13 @@ fn web_search_request_rejects_invalid_or_unsupported_options() {
             .as_object_mut()
             .unwrap()
             .extend(change.as_object().unwrap().clone());
-        assert!(
-            protocol::request(&req, &model(), &Default::default()).is_err(),
-            "{change}"
-        );
+        assert!(protocol::request(&req, &model()).is_err(), "{change}");
     }
     for kind in ["web_search_20260209", "web_search_20260318"] {
         let mut req = request();
         req["tools"] = json!([{"type":kind,"name":"web_search","max_uses":8}]);
         assert!(
-            protocol::request(&req, &model(), &Default::default())
+            protocol::request(&req, &model())
                 .unwrap_err()
                 .message
                 .contains("unsupported hosted tool type")
@@ -269,7 +241,7 @@ fn web_search_request_rejects_invalid_or_unsupported_options() {
         let mut req = request();
         req["tools"] = tools;
         assert!(
-            protocol::request(&req, &model(), &Default::default()).is_err(),
+            protocol::request(&req, &model()).is_err(),
             "{}",
             req["tools"]
         );
@@ -283,10 +255,7 @@ fn web_search_request_rejects_invalid_or_unsupported_options() {
         req.as_object_mut()
             .unwrap()
             .extend(control.as_object().unwrap().clone());
-        assert!(
-            protocol::request(&req, &model(), &Default::default()).is_err(),
-            "{control}"
-        );
+        assert!(protocol::request(&req, &model()).is_err(), "{control}");
     }
 }
 
@@ -299,7 +268,7 @@ fn ordered_history_images_tool_errors_and_choices() {
         {"role":"assistant","content":[{"type":"text","text":"Checking"},{"type":"tool_use","id":"a","name":"lookup","input":{"url":"a"}},{"type":"tool_use","id":"b","name":"lookup","input":{"url":"b"}}]},
         {"role":"user","content":[{"type":"tool_result","tool_use_id":"b","is_error":true,"content":[{"type":"text","text":"denied"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"YWJj"}}]},{"type":"tool_result","tool_use_id":"a","content":{"answer":42}},{"type":"text","text":"Continue"}]}
     ]);
-    let out = protocol::request(&req, &model(), &Default::default()).unwrap();
+    let out = protocol::request(&req, &model()).unwrap();
     assert_eq!(out["model"], "gpt-test");
     assert_eq!(
         out["input"][0]["content"][0]["text"],
@@ -331,7 +300,7 @@ fn ordered_history_images_tool_errors_and_choices() {
     for (source, target) in [("auto", "auto"), ("any", "required"), ("none", "none")] {
         req["tool_choice"] = json!({"type":source});
         assert_eq!(
-            protocol::request(&req, &model(), &Default::default()).unwrap()["tool_choice"],
+            protocol::request(&req, &model()).unwrap()["tool_choice"],
             target
         );
     }
@@ -348,28 +317,25 @@ fn rejects_meaningful_unsupported_content_and_orphan_results() {
         req.as_object_mut()
             .unwrap()
             .extend(change.as_object().unwrap().clone());
-        assert!(protocol::request(&req, &model(), &Default::default()).is_err());
+        assert!(protocol::request(&req, &model()).is_err());
     }
     let mut req = request();
     req["messages"][0]["content"] =
         json!([{"type":"tool_result","tool_use_id":"missing","content":"never drop me"}]);
-    assert!(protocol::request(&req, &model(), &Default::default()).is_err());
+    assert!(protocol::request(&req, &model()).is_err());
 }
 
 #[test]
 fn context_management_preserves_history_and_rejects_unimplemented_edits() {
     let mut req = request();
-    let expected = protocol::request(&req, &model(), &Default::default()).unwrap();
+    let expected = protocol::request(&req, &model()).unwrap();
     for context in [
         json!({}),
         json!({"edits":[]}),
         json!({"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}),
     ] {
         req["context_management"] = context;
-        assert_eq!(
-            protocol::request(&req, &model(), &Default::default()).unwrap(),
-            expected
-        );
+        assert_eq!(protocol::request(&req, &model()).unwrap(), expected);
     }
     for context in [
         json!({"edits":false}),
@@ -380,7 +346,7 @@ fn context_management_preserves_history_and_rejects_unimplemented_edits() {
         json!({"edits":[{"type":"clear_thinking_20251015","keep":"all","unknown":true}]}),
     ] {
         req["context_management"] = context;
-        assert!(protocol::request(&req, &model(), &Default::default()).is_err());
+        assert!(protocol::request(&req, &model()).is_err());
     }
 }
 
@@ -392,13 +358,13 @@ fn deferred_tools_load_from_references_without_losing_result_content() {
         {"name":"lookup","description":"Find a record","input_schema":{"type":"object"},"defer_loading":true},
         {"name":"unused","input_schema":{"type":"object"},"defer_loading":true}
     ]);
-    let initial = protocol::request(&req, &model(), &Default::default()).unwrap();
+    let initial = protocol::request(&req, &model()).unwrap();
     assert_eq!(initial["tools"].as_array().unwrap().len(), 1);
     req["messages"].as_array_mut().unwrap().extend([
         json!({"role":"assistant","content":[{"type":"tool_use","id":"search","name":"ToolSearch","input":{"query":"lookup"}}]}),
         json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"search","content":[{"type":"text","text":"Found a tool"},{"type":"tool_reference","tool_name":"lookup"},{"type":"image","source":{"type":"url","url":"https://example.org/result.png"}}]}]})
     ]);
-    let out = protocol::request(&req, &model(), &Default::default()).unwrap();
+    let out = protocol::request(&req, &model()).unwrap();
     assert_eq!(out["tools"].as_array().unwrap().len(), 2);
     assert_eq!(out["tools"][1]["name"], "lookup");
     assert_eq!(
@@ -414,14 +380,11 @@ fn deferred_tools_load_from_references_without_losing_result_content() {
     );
     assert_eq!(out["input"][3]["output"][2]["type"], "input_image");
     req["messages"][2]["content"][0]["content"][1]["tool_name"] = json!("missing");
-    assert!(protocol::request(&req, &model(), &Default::default()).is_err());
+    assert!(protocol::request(&req, &model()).is_err());
     req["messages"].as_array_mut().unwrap().truncate(1);
-    assert_eq!(
-        protocol::request(&req, &model(), &Default::default()).unwrap(),
-        initial
-    );
+    assert_eq!(protocol::request(&req, &model()).unwrap(), initial);
     req["tools"][1]["defer_loading"] = json!("true");
-    assert!(protocol::request(&req, &model(), &Default::default()).is_err());
+    assert!(protocol::request(&req, &model()).is_err());
 }
 
 fn upstream_response(output: Value) -> Value {
@@ -484,60 +447,47 @@ async fn web_search_max_uses_eight_round_trip_restores_native_output_after_resta
     let response: Value = response.json().await.unwrap();
     assert_eq!(status, 200, "{response}");
     assert_eq!(response["stop_reason"], "end_turn");
-    assert_eq!(response["content"].as_array().unwrap().len(), 3);
+    assert_eq!(response["content"].as_array().unwrap().len(), 2);
     assert_eq!(
-        response["content"][1],
+        response["content"][0],
         json!({"type":"text","text":"héllo"})
     );
     assert_eq!(
-        response["content"][2]["text"],
+        response["content"][1]["text"],
         "\n\nSources:\n- <https://example.org/report>\n- <https://example.net/a%20b>"
     );
     task.abort();
     let _ = task.await;
     up_task.abort();
     let _ = up_task.await;
-    let store = state::Store::open(directory.clone(), 100_000, 50_000)
-        .await
-        .unwrap();
     req["messages"].as_array_mut().unwrap().extend([
         json!({"role":"assistant","content":response["content"]}),
         json!({"role":"user","content":"Continue"}),
     ]);
-    let restored = store
-        .restore_scoped(&req, "openai", "gpt-test")
-        .await
-        .unwrap();
-    assert_eq!(json!(restored[&1]), native["output"]);
-    let replay = protocol::request(&req, &model(), &restored).unwrap();
-    assert_eq!(replay["input"][2], native["output"][0]);
-    assert_eq!(replay["input"][3], native["output"][1]);
-    assert_eq!(replay["input"][4], native["output"][2]);
-    assert_eq!(replay["input"][5]["content"][0]["text"], "Continue");
-    let subscription = protocol::subscription_request(&req, replay).unwrap();
-    assert_eq!(subscription["input"][1], native["output"][0]);
-    assert_eq!(subscription["input"][2], native["output"][1]);
-    assert_eq!(subscription["input"][3], native["output"][2]);
-    assert!(subscription.get("max_tool_calls").is_none());
-    for index in [1, 2] {
-        let mut changed = req.clone();
-        changed["messages"][1]["content"][index]["text"] = json!("changed visible content");
-        assert!(
-            store
-                .restore_scoped(&changed, "openai", "gpt-test")
-                .await
-                .is_err()
-        );
-    }
-    req["messages"][1]["content"].as_array_mut().unwrap().pop();
+    // Hosted search produces no reasoning carrier, so the turn replays as the
+    // visible text plus the Sources block the response already carries.
+    let replay = protocol::request(&req, &model()).unwrap();
     assert!(
-        store
-            .restore_scoped(&req, "openai", "gpt-test")
-            .await
-            .is_err()
+        !replay["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "reasoning")
     );
-    drop(store);
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    assert_eq!(replay["input"][2]["content"][0]["text"], "héllo");
+    assert_eq!(replay["input"][3]["content"][0]["text"], "Continue");
+    let subscription = protocol::subscription_request(&req, replay).unwrap();
+    assert!(subscription.get("max_tool_calls").is_none());
+
+    // A rewritten visible turn still translates.
+    let mut changed = req.clone();
+    changed["messages"][1]["content"][0]["text"] = json!("changed visible content");
+    let replay = protocol::request(&changed, &model()).unwrap();
+    assert_eq!(
+        replay["input"][2]["content"][0]["text"],
+        "changed visible content"
+    );
+    let _ = tokio::fs::remove_dir_all(directory).await;
 }
 
 #[tokio::test]
@@ -648,11 +598,11 @@ async fn web_search_unsolicited_citations_with_stops_or_structured_output_fail_j
     let _ = task.await;
     up_task.abort();
     let _ = up_task.await;
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    let _ = tokio::fs::remove_dir_all(directory).await;
 }
 
 #[tokio::test]
-async fn tool_default_replay_uses_the_original_schema_after_restart() {
+async fn rewritten_assistant_turns_still_replay_their_reasoning() {
     use axum::{Json, Router, routing::post};
     let native = upstream_response(json!([
         {"type":"reasoning","id":"rs","summary":[],"encrypted_content":"opaque"},
@@ -691,59 +641,46 @@ async fn tool_default_replay_uses_the_original_schema_after_restart() {
     task.abort();
     let _ = task.await;
     upstream_task.abort();
-    let store = state::Store::open(directory.clone(), 100_000, 50_000)
-        .await
-        .unwrap();
+
+    // Claude Code materializes omitted defaults, renames IDs and rewrites tool
+    // input between turns. None of that may cost the turn its reasoning.
     let original = response["content"].clone();
-    for input in [original[1]["input"].clone(), {
-        let mut input = original[1]["input"].clone();
-        input["replace_all"] = json!(false);
-        input
-    }] {
-        req["messages"] = json!([{"role":"assistant","content":original}]);
-        req["messages"][0]["content"][1]["input"] = input;
+    type Edit = (&'static str, fn(&mut Value));
+    let edits: [Edit; 6] = [
+        ("materialized default", |c| {
+            c[1]["input"]["replace_all"] = json!(false)
+        }),
+        ("changed argument", |c| {
+            c[1]["input"]["file_path"] = json!("/tmp/changed")
+        }),
+        ("unknown argument", |c| {
+            c[1]["input"]["unknown"] = json!(false)
+        }),
+        ("renamed call", |c| c[1]["id"] = json!("changed")),
+        ("renamed tool", |c| c[1]["name"] = json!("Other")),
+        ("foreign carrier", |c| {
+            c[0]["data"] = json!("anthropic-signature")
+        }),
+    ];
+    for (label, edit) in edits {
+        let mut content = original.clone();
+        edit(&mut content);
+        let call_id = content[1]["id"].clone();
+        req["messages"] = json!([
+            {"role":"assistant","content":content},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":call_id,"content":"ok"}]}
+        ]);
         req["tools"] = json!([]);
-        let restored = store
-            .restore_scoped(&req, "openai", "gpt-test")
-            .await
-            .unwrap();
-        assert_eq!(json!(restored[&0]), native["output"]);
+        let replay = protocol::request(&req, &model()).unwrap();
+        if label == "foreign carrier" {
+            // A carrier tinyllm did not write is ignored, not rejected.
+            assert_eq!(replay["input"][1]["type"], "function_call", "{label}");
+        } else {
+            assert_eq!(replay["input"][1], native["output"][0], "{label}");
+            assert_eq!(replay["input"][2]["call_id"], call_id, "{label}");
+        }
     }
-    let valid = req.clone();
-    for (pointer, value) in [
-        ("/messages/0/content/1/input/replace_all", json!(true)),
-        (
-            "/messages/0/content/1/input/file_path",
-            json!("/tmp/changed"),
-        ),
-        ("/messages/0/content/1/id", json!("changed")),
-        ("/messages/0/content/1/name", json!("Other")),
-        ("/messages/0/content/1", json!(42)),
-        ("/messages/0/content/1", json!([])),
-        ("/messages/0/content/1", json!("invalid")),
-    ] {
-        let mut changed = valid.clone();
-        *changed.pointer_mut(pointer).unwrap() = value;
-        changed["tools"] =
-            json!([{"name":"Edit","input_schema":{"properties":{"replace_all":{"default":true}}}}]);
-        assert!(
-            store
-                .restore_scoped(&changed, "openai", "gpt-test")
-                .await
-                .is_err(),
-            "{pointer}"
-        );
-    }
-    let mut changed = valid;
-    changed["messages"][0]["content"][1]["input"]["unknown"] = json!(false);
-    assert!(
-        store
-            .restore_scoped(&changed, "openai", "gpt-test")
-            .await
-            .is_err()
-    );
-    drop(store);
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    let _ = tokio::fs::remove_dir_all(directory).await;
 }
 
 #[tokio::test]
@@ -780,57 +717,272 @@ async fn classifier_stop_sequence_returns_only_visible_output() {
     assert_eq!(response["stop_reason"], "stop_sequence");
     assert_eq!(response["stop_sequence"], "</block>");
     assert_eq!(response["content"].as_array().unwrap().len(), 2);
+    assert_eq!(response["content"][0]["type"], "redacted_thinking");
     assert_eq!(response["content"][1]["text"], "<block>false");
     assert_eq!(response["usage"]["output_tokens"], 25);
     task.abort();
     let _ = task.await;
     up_task.abort();
-    let store = state::Store::open(directory.clone(), 100_000, 50_000)
-        .await
-        .unwrap();
-    let restored = store
-        .restore_scoped(
-            &json!({"messages":[{"role":"assistant","content":response["content"]}]}),
-            "openai",
-            "gpt-test",
-        )
-        .await
-        .unwrap();
-    assert_eq!(restored[&0].len(), 2);
-    assert_eq!(restored[&0][0]["encrypted_content"], "opaque-before");
-    assert_eq!(restored[&0][1]["content"][0]["text"], "<block>false");
-    assert!(restored[&0][1].get("id").is_none());
-    drop(store);
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    let req = json!({"model":"openai/gpt-test","max_tokens":1024,"messages":[{"role":"assistant","content":response["content"]}]});
+    let replay = protocol::request(&req, &model()).unwrap();
+    assert_eq!(replay["input"][0]["encrypted_content"], "opaque-before");
+    assert_eq!(replay["input"][1]["content"][0]["text"], "<block>false");
+    let _ = tokio::fs::remove_dir_all(directory).await;
 }
 
-#[tokio::test]
-async fn continuation_survives_restart_forks_and_explicit_compaction_boundary() {
-    use state::Store;
-    let directory =
-        std::env::temp_dir().join(format!("tinyllm-state-test-{}", uuid::Uuid::new_v4()));
-    let reference = Store::reference();
+#[test]
+fn model_switch_preserves_reasoning_carriers() {
+    let native = upstream_response(json!([
+        {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"},
+        {"type":"message","id":"msg_1","role":"assistant","phase":"final_answer","status":"completed","content":[{"type":"output_text","text":"Ready","annotations":[]}]}
+    ]));
+    let content = serde_json::to_value(
+        protocol::response(&native, "openai/gpt-5.6-sol")
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    let req = json!({"model":"openai/gpt-5.6-terra","max_tokens":1024,"messages":[{"role":"assistant","content":content}]});
+    // The carrier is self-contained, so any model on this provider replays it.
+    for model_id in ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"] {
+        let model = crate::providers::openai::models::Model {
+            id: model_id.into(),
+            ..model()
+        };
+        let replay = protocol::request(&req, &model).unwrap();
+        assert_eq!(replay["input"][0], native["output"][0], "{model_id}");
+        assert_eq!(replay["input"][1]["content"][0]["text"], "Ready");
+    }
+}
+
+#[test]
+fn model_switch_carriers_replay_text_and_tool_only_history() {
+    let text = json!({"type":"message","id":"msg_1","role":"assistant","phase":"commentary","status":"completed","content":[{"type":"output_text","text":"Checking","annotations":[]}]});
+    let call = json!({"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{}","status":"completed"});
+    let other = json!({"type":"function_call","id":"fc_2","call_id":"call_2","name":"lookup","arguments":"{}","status":"completed"});
+    let mut long = call.clone();
+    long["call_id"] = json!("n".repeat(1024));
+    for output in [
+        vec![text.clone()],
+        vec![call.clone()],
+        vec![text, call, other],
+        vec![long],
+    ] {
+        let mut items =
+            vec![json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"})];
+        items.extend(output);
+        let native = upstream_response(json!(items));
+        let content = serde_json::to_value(
+            protocol::response(&native, "openai/gpt-5.6-sol")
+                .unwrap()
+                .content,
+        )
+        .unwrap();
+        for keep_thinking in [false, true] {
+            let mut wire = content.clone();
+            wire.as_array_mut()
+                .unwrap()
+                .retain(|block| keep_thinking || block["type"] != "redacted_thinking");
+            let mut req = request();
+            req["model"] = json!("openai/gpt-5.6-terra");
+            let messages = req["messages"].as_array_mut().unwrap();
+            for block in wire.as_array().unwrap() {
+                messages.push(json!({"role":"assistant","content":[block]}));
+            }
+            let results: Vec<_> = wire
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .map(|block| json!({"type":"tool_result","tool_use_id":block["id"],"content":"ok"}))
+                .collect();
+            messages.push(json!({"role":"user","content":if results.is_empty() {json!("Continue")} else {json!(results)}}));
+            let translated = protocol::request(
+                &req,
+                &Model {
+                    id: "gpt-5.6-terra".into(),
+                    reasoning_effort: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(translated["model"], "gpt-5.6-terra");
+            let input = translated["input"].as_array().unwrap();
+            assert_eq!(
+                input.iter().any(|item| *item == items[0]),
+                keep_thinking,
+                "reasoning replays only when its carrier survives"
+            );
+            for call in items.iter().filter(|item| item["type"] == "function_call") {
+                assert!(
+                    input.iter().any(|item| item["type"] == "function_call"
+                        && item["call_id"] == call["call_id"])
+                );
+            }
+            for item in input
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+            {
+                assert!(items.iter().any(|native| native["type"] == "function_call"
+                    && native["call_id"] == item["call_id"]));
+            }
+            if !results.is_empty() {
+                let last = req["messages"].as_array().unwrap().len() - 1;
+                let mut changed = req.clone();
+                changed["messages"][last]["content"][0]["tool_use_id"] = json!("unknown_call");
+                assert!(protocol::request(&changed, &model()).is_err());
+                let mut duplicate = req.clone();
+                duplicate["messages"][last]["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(results[0].clone());
+                assert!(protocol::request(&duplicate, &model()).is_err());
+                let mut premature = req.clone();
+                let messages = premature["messages"].as_array_mut().unwrap();
+                let result = messages.remove(last);
+                messages.insert(1, result);
+                assert!(
+                    protocol::request(&premature, &model())
+                        .unwrap_err()
+                        .message
+                        .contains("unresolved client tool call")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn history_from_a_stateful_build_still_replays() {
+    // A session that started before carriers carries a store reference on its
+    // assistant text and a wrapped tool call ID. Neither may fail the request.
+    let mut req = request();
+    req["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":[
+            {"type":"redacted_thinking","data":"tinyllm:v1:2b6f0cc904d137be2e1730235f5664094b83"},
+            {"type":"text","text":"old answer","tinyllm_continuation":"tinyllm:v1:2b6f0cc904d137be2e1730235f5664094b83"},
+            {"type":"tool_use","id":"toolu_tinyllm_2b6f0cc904d137be2e1730235f5664094b83_Y2FsbF9h","name":"lookup","input":{}}
+        ]}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_tinyllm_2b6f0cc904d137be2e1730235f5664094b83_Y2FsbF9h","content":"ok"}]}),
+    ]);
+    let out = protocol::request(&req, &model()).unwrap();
+    let input = out["input"].as_array().unwrap();
+    // The legacy reference is not a carrier, so the turn replays portably.
+    assert!(!input.iter().any(|item| item["type"] == "reasoning"));
+    assert_eq!(input[2]["content"][0]["text"], "old answer");
+    assert_eq!(input[3]["type"], "function_call");
+    assert_eq!(input[4]["type"], "function_call_output");
+    assert_eq!(input[3]["call_id"], input[4]["call_id"]);
+    assert!(!out.to_string().contains("tinyllm_continuation"));
+}
+
+#[test]
+fn carrier_stripping_leaves_tool_arguments_and_schemas_alone() {
+    use crate::providers::http::strip_carriers;
+    // Tool data may legitimately describe these shapes; only protocol slots
+    // holding a real carrier may be rewritten.
+    let mut value = json!({
+        "messages":[{"role":"assistant","content":[
+            {"type":"redacted_thinking","data":"tinyllm:v1:cnNfMQ:opaque"},
+            {"type":"text","text":"kept"},
+            {"type":"tool_use","id":"call_1","name":"write","input":{
+                "blocks":[{"type":"tinyllm_continuation","data":"user content"},
+                          {"type":"redacted_thinking","data":"tinyllm:v1:also user content"}]
+            }}
+        ],"reasoning_details":[{"type":"tinyllm_continuation","data":"tinyllm:v1:cnNfMQ:opaque"}]}],
+        "tools":[{"name":"write","input_schema":{"properties":{"type":{"enum":["tinyllm_continuation","redacted_thinking"]}}}}]
+    });
+    let tools = value["tools"].clone();
+    let tool_input = value["messages"][0]["content"][2]["input"].clone();
+    strip_carriers(&mut value);
+    assert_eq!(value["tools"], tools, "tool schemas must survive");
+    let blocks = value["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2, "only the carrier block is removed");
+    assert_eq!(blocks[0]["text"], "kept");
+    assert_eq!(
+        blocks[1]["input"], tool_input,
+        "tool arguments must survive"
+    );
+    assert!(
+        value["messages"][0]["reasoning_details"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn portable_anthropic_history_preserves_text_and_tools_without_reasoning() {
+    let native_id = "call_legacy";
+    let mut wire = json!([
+        {"type":"text","text":"before"},
+        {"type":"tool_use","id":native_id,"name":"lookup","input":{"url":"https://example.test"}},
+        {"type":"text","text":"after"}
+    ]);
+    // Foreign thinking carriers replay as nothing rather than failing the turn.
+    wire.as_array_mut().unwrap().splice(
+        0..0,
+        [
+            json!({"type":"thinking","thinking":"private foreign thinking","signature":"foreign-signature"}),
+            json!({"type":"redacted_thinking","data":"gAAAAforeign"}),
+        ],
+    );
+    let mut req = request();
+    req["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":wire}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":native_id,"content":"ok"}]}),
+    ]);
+    let body = protocol::request(&req, &model()).unwrap();
+    let input = body["input"].as_array().unwrap();
+    let texts: Vec<_> = input
+        .iter()
+        .filter(|item| item["role"] == "assistant")
+        .flat_map(|item| item["content"].as_array().unwrap())
+        .map(|part| {
+            assert_eq!(part["type"], "output_text");
+            part["text"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(texts, ["before", "after"]);
+    for item in input.iter().filter(|item| {
+        matches!(
+            item["type"].as_str(),
+            Some("function_call" | "function_call_output")
+        )
+    }) {
+        assert_eq!(item["call_id"], native_id);
+    }
+    assert!(!input.iter().any(|item| item["type"] == "reasoning"));
+    assert!(!body.to_string().contains("private foreign thinking"));
+    assert!(!body.to_string().contains("gAAAAforeign"));
+    for extra in [
+        json!({"type":"future_content","text":"unsupported"}),
+        json!({"type":"thinking","thinking":"bad signature shape","signature":42}),
+    ] {
+        let mut invalid = req.clone();
+        invalid["messages"][1]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(extra);
+        assert!(protocol::request(&invalid, &model()).is_err());
+    }
+    // A carrier from another tinyllm version replays as portable history.
+    let mut malformed = req.clone();
+    malformed["messages"][1]["content"][1]["data"] = json!("tinyllm:v2:invalid");
+    assert!(protocol::request(&malformed, &model()).is_ok());
+}
+
+#[test]
+fn carriers_survive_restart_and_explicit_compaction_boundary() {
     let native = upstream_response(json!([
         {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque-openai-data"},
         {"type":"message","id":"msg_1","role":"assistant","phase":"commentary","status":"completed","content":[{"type":"output_text","text":"Checking","annotations":[]}]},
         {"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{}","status":"completed"}
     ]));
-    let converted = protocol::response(&native, "openai/gpt-test", &reference).unwrap();
+    let converted = protocol::response(&native, "openai/gpt-test").unwrap();
     assert_eq!(converted.usage.input_tokens, 100);
     assert_eq!(converted.usage.cache_read_input_tokens, 20);
     assert_eq!(converted.usage.output_tokens, 25);
     let content = serde_json::to_value(converted.content).unwrap();
-    let store = Store::open(directory.clone(), 100_000, 50_000)
-        .await
-        .unwrap();
-    store
-        .save(&reference, "gpt-test", &native, content.clone())
-        .await
-        .unwrap();
-    drop(store);
-    let store = Store::open(directory.clone(), 100_000, 50_000)
-        .await
-        .unwrap();
     let mut req = request();
     req["context_management"] = json!({"edits":[{"type":"clear_thinking_20251015","keep":"all"}]});
     req["thinking"] = json!({"type":"adaptive","display":"omitted"});
@@ -838,21 +990,27 @@ async fn continuation_survives_restart_forks_and_explicit_compaction_boundary() 
         json!({"role":"assistant","content":content}),
         json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"ok"}]})
     ]);
-    let (a, b) = tokio::join!(
-        store.restore(&req, "gpt-test"),
-        store.restore(&req, "gpt-test")
-    );
-    assert_eq!(a.as_ref().unwrap(), b.as_ref().unwrap());
-    let out = protocol::request(&req, &model(), &a.unwrap()).unwrap();
+    // The carrier travels with the client, so no gateway state has to survive.
+    let out = protocol::request(&req, &model()).unwrap();
     assert_eq!(out["input"][2]["encrypted_content"], "opaque-openai-data");
-    assert_eq!(out["input"][3]["phase"], "commentary");
+    assert_eq!(out["input"][3]["content"][0]["text"], "Checking");
+
+    // A rewritten visible turn keeps its reasoning.
     req["messages"][1]["content"][1]["text"] = json!("modified");
-    assert!(store.restore(&req, "gpt-test").await.is_err());
+    let out = protocol::request(&req, &model()).unwrap();
+    assert_eq!(out["input"][2]["encrypted_content"], "opaque-openai-data");
+    assert_eq!(out["input"][3]["content"][0]["text"], "modified");
+
+    // Compaction drops the carriers; the summary replays as plain history.
     req["messages"] = json!([{"role":"user","content":"Compacted summary; new reasoning context"}]);
-    assert!(store.restore(&req, "gpt-test").await.unwrap().is_empty());
-    req["messages"] = json!([{"role":"assistant","content":[{"type":"redacted_thinking","data":Store::reference()}]}]);
-    assert!(store.restore(&req, "gpt-test").await.is_err());
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    let out = protocol::request(&req, &model()).unwrap();
+    assert!(
+        !out["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "reasoning")
+    );
 }
 
 fn claude_fork_request() -> Value {
@@ -870,27 +1028,17 @@ fn claude_fork_request() -> Value {
 
 #[tokio::test]
 async fn claude_fork_bootstrap_preserves_inherited_and_worker_reasoning() {
-    use state::Store;
-    let directory = std::env::temp_dir().join(format!("tinyllm-fork-{}", uuid::Uuid::new_v4()));
-    let store = Store::open(directory.clone(), 100_000, 50_000)
-        .await
-        .unwrap();
     let mut req = claude_fork_request();
     let native = upstream_response(json!([
         {"type":"reasoning","id":"rs_parent","summary":[],"encrypted_content":"parent-reasoning"},
         {"type":"message","id":"msg_parent","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Parent context","annotations":[]}]}
     ]));
-    let reference = Store::reference();
     let content = serde_json::to_value(
-        protocol::response(&native, "openai/gpt-test", &reference)
+        protocol::response(&native, "openai/gpt-test")
             .unwrap()
             .content,
     )
     .unwrap();
-    store
-        .save(&reference, "gpt-test", &native, content.clone())
-        .await
-        .unwrap();
     req["messages"].as_array_mut().unwrap().splice(
         1..1,
         [
@@ -898,10 +1046,9 @@ async fn claude_fork_bootstrap_preserves_inherited_and_worker_reasoning() {
             json!({"role":"user","content":"Start the worker"}),
         ],
     );
-    let restored = store.restore(&req, "gpt-test").await.unwrap();
-    let out = protocol::request(&req, &model(), &restored).unwrap();
+    let out = protocol::request(&req, &model()).unwrap();
     assert_eq!(out["input"][2]["encrypted_content"], "parent-reasoning");
-    assert_eq!(out["input"][3]["phase"], "commentary");
+    assert_eq!(out["input"][3]["content"][0]["text"], "Parent context");
     assert_eq!(out["input"][5]["type"], "function_call");
     assert_eq!(out["input"][5]["call_id"], "fork_1");
     assert_eq!(out["input"][6]["type"], "function_call_output");
@@ -919,49 +1066,57 @@ async fn claude_fork_bootstrap_preserves_inherited_and_worker_reasoning() {
         {"type":"reasoning","id":"rs_worker","summary":[],"encrypted_content":"worker-reasoning"},
         {"type":"function_call","call_id":"work_1","name":"lookup","arguments":"{}"}
     ]));
-    let reference = Store::reference();
     let content = serde_json::to_value(
-        protocol::response(&native, "openai/gpt-test", &reference)
+        protocol::response(&native, "openai/gpt-test")
             .unwrap()
             .content,
     )
     .unwrap();
-    store
-        .save(&reference, "gpt-test", &native, content.clone())
-        .await
-        .unwrap();
     req["messages"].as_array_mut().unwrap().extend([
         json!({"role":"assistant","content":content}),
         json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"work_1","content":"ok"}]}),
     ]);
-    drop(store);
-    let store = Store::open(directory.clone(), 100_000, 50_000)
-        .await
-        .unwrap();
-    let restored = store.restore(&req, "gpt-test").await.unwrap();
-    let out = protocol::request(&req, &model(), &restored).unwrap();
+    let out = protocol::request(&req, &model()).unwrap();
     assert_eq!(out["input"][8]["encrypted_content"], "worker-reasoning");
     assert_eq!(out["input"][9]["call_id"], "work_1");
     assert_eq!(out["input"][10]["call_id"], "work_1");
-    for index in [1, 5] {
-        let mut edited = req.clone();
-        edited["messages"][index]["content"][1]["text"] = json!("changed");
-        assert!(store.restore(&edited, "gpt-test").await.is_err());
-    }
-    drop(store);
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    // Editing the inherited parent turn must not cost the fork its reasoning.
+    let mut edited = req.clone();
+    edited["messages"][1]["content"][1]["text"] = json!("changed");
+    let out = protocol::request(&edited, &model()).unwrap();
+    assert_eq!(out["input"][2]["encrypted_content"], "parent-reasoning");
+    assert_eq!(out["input"][8]["encrypted_content"], "worker-reasoning");
+
+    // So must renaming the worker's own tool call.
+    let mut renamed = req;
+    renamed["messages"][5]["content"][1]["name"] = json!("Other");
+    let out = protocol::request(&renamed, &model()).unwrap();
+    assert_eq!(out["input"][8]["encrypted_content"], "worker-reasoning");
+}
+
+#[test]
+fn claude_fork_history_replays_no_reasoning_it_did_not_inherit() {
+    let native = upstream_response(json!([
+        {"type":"reasoning","id":"rs_spawn","summary":[],"encrypted_content":"spawning-reasoning"},
+        {"type":"function_call","id":"fc_spawn_1","call_id":"fork_1","name":"Agent","arguments":"{\"subagent_type\":\"fork\"}"},
+        {"type":"function_call","id":"fc_spawn_2","call_id":"fork_2","name":"Agent","arguments":"{\"subagent_type\":\"fork\"}"}
+    ]));
+    let wire =
+        serde_json::to_value(protocol::response(&native, "openai/old").unwrap().content).unwrap();
+    // Claude Code hands a worker the spawning tool call without its carrier.
+    let mut req = claude_fork_request();
+    req["messages"][1]["content"] = json!([wire[1]]);
+    req["messages"][2]["content"][0]["tool_use_id"] = wire[1]["id"].clone();
+    let output = protocol::request(&req, &model()).unwrap();
+    assert_eq!(output["input"][2]["call_id"], "fork_1");
+    assert_eq!(output["input"][3]["call_id"], "fork_1");
+    assert!(!output.to_string().contains("spawning-reasoning"));
+    assert!(!output.to_string().contains("fork_2"));
 }
 
 #[tokio::test]
 async fn claude_fork_bootstrap_requires_the_complete_start_exchange() {
-    use state::Store;
-    let directory =
-        std::env::temp_dir().join(format!("tinyllm-fork-shape-{}", uuid::Uuid::new_v4()));
-    let store = Store::open(directory.clone(), 100_000, 50_000)
-        .await
-        .unwrap();
     let req = claude_fork_request();
-    assert!(store.restore(&req, "gpt-test").await.is_ok());
     let mut parallel = req.clone();
     let mut call = parallel["messages"][1]["content"][0].clone();
     call["id"] = json!("fork_2");
@@ -975,12 +1130,11 @@ async fn claude_fork_bootstrap_requires_the_complete_start_exchange() {
         .as_array_mut()
         .unwrap()
         .insert(1, result);
-    let restored = store.restore(&parallel, "gpt-test").await.unwrap();
-    let out = protocol::request(&parallel, &model(), &restored).unwrap();
+    let out = protocol::request(&parallel, &model()).unwrap();
     assert_eq!(out["input"][3]["call_id"], "fork_2");
     assert_eq!(out["input"][5]["call_id"], "fork_2");
     parallel["messages"][2]["content"][1]["tool_use_id"] = json!("fork_1");
-    assert!(store.restore(&parallel, "gpt-test").await.is_err());
+    assert!(protocol::request(&parallel, &model()).is_err());
     for (pointer, value) in [
         ("/messages/1/content", json!([])),
         ("/messages/1/content/0/name", json!("lookup")),
@@ -1004,30 +1158,36 @@ async fn claude_fork_bootstrap_requires_the_complete_start_exchange() {
     ] {
         let mut invalid = req.clone();
         *invalid.pointer_mut(pointer).unwrap() = value;
-        assert!(
-            store.restore(&invalid, "gpt-test").await.is_err(),
+        let valid = matches!(
+            pointer,
+            "/messages/1/content/0/name"
+                | "/messages/1/content/0/input/subagent_type"
+                | "/messages/2/content/0/content/0/text"
+                | "/messages/2/content/1/text"
+        );
+        assert_eq!(
+            protocol::request(&invalid, &model()).is_ok(),
+            valid,
             "{pointer}"
         );
     }
-    let mut invalid = req.clone();
-    invalid["messages"][2]["content"][0]["is_error"] = json!(true);
-    assert!(store.restore(&invalid, "gpt-test").await.is_err());
-    let mut invalid = req.clone();
-    invalid["messages"][2]["content"][1]["text"] = json!(
+    let mut error_result = req.clone();
+    error_result["messages"][2]["content"][0]["is_error"] = json!(true);
+    let mut empty_directive = req.clone();
+    empty_directive["messages"][2]["content"][1]["text"] = json!(
         req["messages"][2]["content"][1]["text"]
             .as_str()
             .unwrap()
             .replace("Your directive: Check the transport.", "Your directive: ")
     );
-    assert!(store.restore(&invalid, "gpt-test").await.is_err());
-    let mut invalid = req.clone();
-    invalid["messages"][1]["content"]
+    let mut extra_text = req.clone();
+    extra_text["messages"][1]["content"]
         .as_array_mut()
         .unwrap()
         .push(json!({"type":"text","text":"Unreferenced model output"}));
-    assert!(store.restore(&invalid, "gpt-test").await.is_err());
-    drop(store);
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    for portable in [error_result, empty_directive, extra_text] {
+        assert!(protocol::request(&portable, &model()).is_ok());
+    }
 }
 
 #[test]
@@ -1035,14 +1195,14 @@ fn invalid_tool_json_and_upstream_failures_never_become_success() {
     let mut r = upstream_response(
         json!([{"type":"function_call","call_id":"a","name":"lookup","arguments":"{broken"}]),
     );
-    assert!(protocol::response(&r, "openai/gpt-test", "reference").is_err());
+    assert!(protocol::response(&r, "openai/gpt-test").is_err());
     r["output"] = json!([]);
     r["status"] = json!("failed");
-    assert!(protocol::response(&r, "openai/gpt-test", "reference").is_err());
+    assert!(protocol::response(&r, "openai/gpt-test").is_err());
     r["status"] = json!("incomplete");
     r["incomplete_details"] = json!({"reason":"max_output_tokens"});
     assert_eq!(
-        protocol::response(&r, "openai/gpt-test", "reference")
+        protocol::response(&r, "openai/gpt-test")
             .unwrap()
             .stop_reason
             .as_deref(),
@@ -1079,8 +1239,7 @@ async fn fragmented_stream_preserves_utf8_parallel_arguments_and_completion() {
             .collect::<Vec<_>>(),
     );
     let mut decoder = Box::pin(stream::decode(upstream, 1_000_000));
-    let mut translator =
-        stream::Translator::new("openai/gpt-test".into(), "tinyllm:v1:test".into());
+    let mut translator = stream::Translator::new("openai/gpt-test".into());
     let mut output = Vec::new();
     while let Some(event) = decoder.next().await {
         output.extend(
@@ -1096,9 +1255,9 @@ async fn fragmented_stream_preserves_utf8_parallel_arguments_and_completion() {
         .iter()
         .filter(|e| e["type"] == "content_block_start")
         .collect();
-    assert_eq!(starts.len(), 4);
-    assert_eq!(starts[2]["content_block"]["id"], "call_a");
-    assert_eq!(starts[3]["content_block"]["id"], "call_b");
+    assert_eq!(starts.len(), 3);
+    assert_eq!(starts[1]["content_block"]["id"], "call_a");
+    assert_eq!(starts[2]["content_block"]["id"], "call_b");
     let deltas = |index: u64, key: &str| {
         output
             .iter()
@@ -1106,9 +1265,9 @@ async fn fragmented_stream_preserves_utf8_parallel_arguments_and_completion() {
             .map(|e| e["delta"][key].as_str().unwrap())
             .collect::<String>()
     };
-    assert_eq!(deltas(1, "text"), "héllo");
-    assert_eq!(deltas(2, "partial_json"), "{\"a\":1}");
-    assert_eq!(deltas(3, "partial_json"), "{\"b\":2}");
+    assert_eq!(deltas(0, "text"), "héllo");
+    assert_eq!(deltas(1, "partial_json"), "{\"a\":1}");
+    assert_eq!(deltas(2, "partial_json"), "{\"b\":2}");
     let mut open = None;
     for e in &output {
         if e["type"] == "content_block_start" {
@@ -1220,12 +1379,8 @@ fn web_search_stream_fixture() -> Vec<Value> {
 fn web_search_terminal_items_preserve_the_answer_and_opaque_actions() {
     use crate::models::anthropic::{Delta, StreamEvent};
     let baseline = web_search_stream_fixture();
-    let expected = protocol::response(
-        &baseline.last().unwrap()["response"],
-        "openai/gpt-test",
-        "reference",
-    )
-    .unwrap();
+    let expected =
+        protocol::response(&baseline.last().unwrap()["response"], "openai/gpt-test").unwrap();
     for status in ["failed", "incomplete", "completed"] {
         for sparse in [false, true] {
             let mut events = baseline.clone();
@@ -1246,13 +1401,12 @@ fn web_search_terminal_items_preserve_the_answer_and_opaque_actions() {
                 .unwrap()["item"] = item.clone();
             events.last_mut().unwrap()["response"]["output"][0] = item;
             let native = events.last().unwrap()["response"].clone();
-            let response = protocol::response(&native, "openai/gpt-test", "reference").unwrap();
+            let response = protocol::response(&native, "openai/gpt-test").unwrap();
             assert_eq!(json!(response.content), json!(expected.content));
             if sparse {
                 events.last_mut().unwrap()["response"]["output"] = json!([]);
             }
-            let mut translator =
-                stream::Translator::new("openai/gpt-test".into(), "reference".into());
+            let mut translator = stream::Translator::new("openai/gpt-test".into());
             translator.sparse_completion = sparse;
             let mut text = String::new();
             for event in &events {
@@ -1273,7 +1427,7 @@ fn web_search_terminal_items_preserve_the_answer_and_opaque_actions() {
             );
             let mut failed = native;
             failed["status"] = json!("failed");
-            assert!(protocol::response(&failed, "openai/gpt-test", "reference").is_err());
+            assert!(protocol::response(&failed, "openai/gpt-test").is_err());
         }
     }
 }
@@ -1289,11 +1443,10 @@ fn web_search_json_preserves_text_and_validates_citations() {
     ] {
         let mut response = native.clone();
         response["output"][0]["action"] = action;
-        let response = protocol::response(&response, "openai/gpt-test", "reference").unwrap();
+        let response = protocol::response(&response, "openai/gpt-test").unwrap();
         assert_eq!(
             json!(response.content),
             json!([
-                {"type":"redacted_thinking","data":"reference"},
                 {"type":"text","text":"héllo"},
                 {"type":"tool_use","id":"call_a","name":"lookup","input":{"a":1}},
                 {"type":"tool_use","id":"call_b","name":"lookup","input":{"b":2}},
@@ -1332,7 +1485,7 @@ fn web_search_json_preserves_text_and_validates_citations() {
         let mut changed = native.clone();
         *changed.pointer_mut(pointer).unwrap() = value;
         assert!(
-            protocol::response(&changed, "openai/gpt-test", "reference").is_err(),
+            protocol::response(&changed, "openai/gpt-test").is_err(),
             "{pointer}: {}",
             changed.pointer(pointer).unwrap()
         );
@@ -1362,7 +1515,7 @@ async fn web_search_fragmented_sse_matches_json_and_sparse_subscription_output()
                 .collect::<Vec<_>>(),
         );
         let mut decoded = Box::pin(stream::decode(upstream, 1_000_000));
-        let mut translator = stream::Translator::new("openai/gpt-test".into(), "reference".into());
+        let mut translator = stream::Translator::new("openai/gpt-test".into());
         translator.sparse_completion = sparse;
         let mut output = Vec::new();
         while let Some(event) = decoded.next().await {
@@ -1375,7 +1528,7 @@ async fn web_search_fragmented_sse_matches_json_and_sparse_subscription_output()
             );
         }
         assert_eq!(translator.completed.as_ref(), Some(&native));
-        let response = protocol::response(&native, "openai/gpt-test", "reference").unwrap();
+        let response = protocol::response(&native, "openai/gpt-test").unwrap();
         let mut content = Vec::<Value>::new();
         let mut open = None;
         let mut arguments = String::new();
@@ -1489,7 +1642,7 @@ fn web_search_sse_rejects_invalid_progress_and_changed_annotations() {
             .find(|event| event["type"] == kind)
             .unwrap();
         *event.pointer_mut(pointer).unwrap() = value;
-        let mut translator = stream::Translator::new("openai/gpt-test".into(), "reference".into());
+        let mut translator = stream::Translator::new("openai/gpt-test".into());
         let result = events
             .iter()
             .try_for_each(|event| translator.accept(event).map(|_| ()));
@@ -1499,7 +1652,7 @@ fn web_search_sse_rejects_invalid_progress_and_changed_annotations() {
     let mut events = web_search_stream_fixture();
     events.last_mut().unwrap()["type"] = json!("response.failed");
     events.last_mut().unwrap()["response"]["status"] = json!("failed");
-    let mut translator = stream::Translator::new("openai/gpt-test".into(), "reference".into());
+    let mut translator = stream::Translator::new("openai/gpt-test".into());
     assert!(
         events
             .iter()
@@ -1527,7 +1680,7 @@ fn subscription_sparse_completions_preserve_output_and_ignore_metadata() {
             json!({"type":"response.metadata","metadata":{"safety_buffering":true}}),
         );
         events.insert(2, json!({"type":"codex.response.metadata","metadata":{}}));
-        let mut translator = stream::Translator::new("openai/gpt-test".into(), "ref".into());
+        let mut translator = stream::Translator::new("openai/gpt-test".into());
         translator.sparse_completion = true;
         for event in events {
             translator.accept(&event).unwrap();
@@ -1539,7 +1692,7 @@ fn subscription_sparse_completions_preserve_output_and_ignore_metadata() {
     let mut events = stream_fixture();
     events.retain(|e| !(e["type"] == "response.output_item.done" && e["output_index"] == 2));
     events.last_mut().unwrap()["response"]["output"] = json!([]);
-    let mut translator = stream::Translator::new("openai/gpt-test".into(), "ref".into());
+    let mut translator = stream::Translator::new("openai/gpt-test".into());
     translator.sparse_completion = true;
     let terminal = events.pop().unwrap();
     for event in events {
@@ -1602,7 +1755,7 @@ impl HttpFixture {
             task.abort();
             let _ = task.await;
         }
-        tokio::fs::remove_dir_all(self.directory).await.unwrap();
+        let _ = tokio::fs::remove_dir_all(self.directory).await;
     }
 }
 
@@ -1635,7 +1788,6 @@ async fn http_fixture(prefix: &str, auth_token: Option<&str>) -> HttpFixture {
     let directory = std::env::temp_dir().join(format!("tinyllm-http-{}", uuid::Uuid::new_v4()));
     let mut cfg = config(upstream, directory.clone());
     cfg.server.auth_token = auth_token.map(str::to_owned);
-    cfg.server.state_cleanup = Some(Default::default());
     let provider = cfg.providers.remove("openai").unwrap();
     cfg.providers.insert(prefix.into(), provider);
     let (gateway, gw_task) = serve(crate::server::router(cfg).await.unwrap()).await;
@@ -1650,6 +1802,106 @@ async fn http_fixture(prefix: &str, auth_token: Option<&str>) -> HttpFixture {
 }
 
 #[tokio::test]
+async fn continuation_headers_report_portable_and_mixed_histories() {
+    let fixture = http_fixture("openai", Some("local-secret")).await;
+    for chat in [false, true] {
+        let url = format!(
+            "{}{}",
+            fixture.gateway,
+            if chat {
+                "/v1/chat/completions"
+            } else {
+                "/anthropic/v1/messages"
+            }
+        );
+        let base = json!({"model":"openai/gpt-test","max_tokens":32,"messages":[{"role":"user","content":"hello"}]});
+        let response = fixture
+            .client
+            .post(&url)
+            .bearer_auth("local-secret")
+            .json(&base)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["x-tinyllm-continuation"], "fresh");
+        let _: Value = response.json().await.unwrap();
+        let carrier = "tinyllm:v1:cnNfMQ:opaque";
+        let assistant = if chat {
+            json!({"role":"assistant","content":"answer","reasoning_details":[{"type":"tinyllm_continuation","data":carrier}]})
+        } else {
+            json!({"role":"assistant","content":[{"type":"redacted_thinking","data":carrier},{"type":"text","text":"answer"}]})
+        };
+        let portable = json!({"role":"assistant","content":"legacy answer"});
+        let foreign = "tinyllm:v0:unreadable";
+        let missing = if chat {
+            json!({"role":"assistant","content":"old answer","reasoning_details":[{"type":"tinyllm_continuation","data":foreign}]})
+        } else {
+            json!({"role":"assistant","content":[{"type":"redacted_thinking","data":foreign},{"type":"text","text":"old answer"}]})
+        };
+        let mut restored = base.clone();
+        restored["messages"].as_array_mut().unwrap().extend([
+            assistant.clone(),
+            json!({"role":"user","content":"continue"}),
+        ]);
+        let mut plain = base.clone();
+        plain["messages"]
+            .as_array_mut()
+            .unwrap()
+            .extend([portable, json!({"role":"user","content":"continue"})]);
+        let mut absent = base.clone();
+        absent["messages"]
+            .as_array_mut()
+            .unwrap()
+            .extend([missing, json!({"role":"user","content":"continue"})]);
+        let mut mixed = plain.clone();
+        mixed["messages"]
+            .as_array_mut()
+            .unwrap()
+            .extend([assistant, json!({"role":"user","content":"continue again"})]);
+        for streaming in [false, true] {
+            for (source, status) in [
+                (&restored, "restored"),
+                (&plain, "fresh"),
+                (&absent, "fresh"),
+                (&mixed, "restored"),
+            ] {
+                let mut req = source.clone();
+                req["stream"] = json!(streaming);
+                let response = fixture
+                    .client
+                    .post(&url)
+                    .bearer_auth("local-secret")
+                    .json(&req)
+                    .send()
+                    .await
+                    .unwrap();
+                let http_status = response.status();
+                let continuation = response
+                    .headers()
+                    .get("x-tinyllm-continuation")
+                    .map(|value| value.to_str().unwrap().to_owned());
+                let body = response.text().await.unwrap();
+                assert_eq!(http_status, 200, "chat={chat} {status}: {body}");
+                assert_eq!(continuation.as_deref(), Some(status));
+                if streaming {
+                    assert!(
+                        body.contains(if chat {
+                            "[DONE]"
+                        } else {
+                            "event: message_stop"
+                        }),
+                        "{body}"
+                    );
+                    assert!(!body.contains("event: error"), "{body}");
+                }
+            }
+        }
+    }
+    fixture.close().await;
+}
+
+#[tokio::test]
 async fn http_auth_rejects_missing_and_invalid_client_credentials() {
     let fixture = http_fixture("openai", Some("local-secret")).await;
     for header in [None, Some("authorization"), Some("x-api-key")] {
@@ -1659,11 +1911,49 @@ async fn http_auth_rejects_missing_and_invalid_client_credentials() {
         }
         assert_eq!(call.send().await.unwrap().status(), 401);
     }
+    // The preconnect probe is the one route that answers without credentials.
+    let hello = format!("{}/anthropic/api/hello", fixture.gateway);
+    for response in [
+        fixture.client.get(&hello).send().await.unwrap(),
+        fixture.client.head(&hello).send().await.unwrap(),
+        fixture
+            .client
+            .get(&hello)
+            .header("x-api-key", "wrong-token")
+            .send()
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(response.status(), 200);
+    }
+    // It must not reveal anything, and must not open any other route.
+    let body = fixture
+        .client
+        .get(&hello)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(body, r#"{"ok":true}"#);
+    for path in [
+        "/anthropic/v1/models",
+        "/anthropic/v1/messages/count_tokens",
+    ] {
+        let response = fixture
+            .client
+            .get(format!("{}{path}", fixture.gateway))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401, "{path} must stay authenticated");
+    }
     fixture.close().await;
 }
 
 #[tokio::test]
-async fn http_protocol_preserves_json_streams_and_unique_continuations() {
+async fn http_protocol_preserves_json_streams_and_concurrent_requests() {
     let fixture = http_fixture("openai", Some("local-secret")).await;
     let mut namespaced = request();
     namespaced["model"] = json!("openai/gpt-test");
@@ -1685,8 +1975,8 @@ async fn http_protocol_preserves_json_streams_and_unique_continuations() {
     let b: Value = b.unwrap().json().await.unwrap();
     assert_eq!(a["model"], "openai/gpt-test");
     assert_eq!(b["model"], "openai/gpt-test");
-    assert_eq!(a["content"][1]["text"], "hello");
-    assert_ne!(a["content"][0]["data"], b["content"][0]["data"]);
+    assert_eq!(a["content"][0]["text"], "hello");
+    assert_eq!(b["content"][0]["text"], "hello");
     assert!(fixture.maximum.load(Ordering::SeqCst) >= 2);
     let mut req = namespaced;
     req["stream"] = json!(true);
@@ -1865,7 +2155,7 @@ async fn http_unauthenticated_mode_accepts_requests_with_any_client_credentials(
         let response = call.send().await.unwrap();
         assert_eq!(response.status(), 200);
         assert_eq!(
-            response.json::<Value>().await.unwrap()["content"][1]["text"],
+            response.json::<Value>().await.unwrap()["content"][0]["text"],
             "hello"
         );
     }
@@ -1932,7 +2222,7 @@ async fn disconnect_cancels_upstream_for_stream_and_json() {
                 futures::pin_mut!(events);
                 loop {
                     let event = events.next().await.unwrap().unwrap();
-                    if event["type"] == "content_block_stop" && event["index"] == 1 {
+                    if event["type"] == "content_block_stop" && event["index"] == 0 {
                         break;
                     }
                 }
@@ -1974,7 +2264,7 @@ async fn disconnect_cancels_upstream_for_stream_and_json() {
         );
         gw_task.abort();
         up_task.abort();
-        tokio::fs::remove_dir_all(dir).await.unwrap();
+        let _ = tokio::fs::remove_dir_all(dir).await;
         assert!(
             stopped.is_ok(),
             "upstream continued after disconnect; streaming={streaming}"
@@ -1985,7 +2275,7 @@ async fn disconnect_cancels_upstream_for_stream_and_json() {
 #[tokio::test]
 async fn stream_failure_truncation_and_bounds_are_explicit() {
     use futures::StreamExt;
-    let mut translator = stream::Translator::new("openai/gpt-test".into(), "ref".into());
+    let mut translator = stream::Translator::new("openai/gpt-test".into());
     translator
         .accept(&json!({"type":"response.created","response":{"id":"r"}}))
         .unwrap();
@@ -2011,57 +2301,35 @@ async fn stream_failure_truncation_and_bounds_are_explicit() {
     assert_eq!(response.status(), 413);
     assert_eq!(response.json::<Value>().await.unwrap()["type"], "error");
     task.abort();
-    tokio::fs::remove_dir_all(dir).await.unwrap();
+    let _ = tokio::fs::remove_dir_all(dir).await;
 }
 
 #[tokio::test]
-async fn dropped_duplicate_and_oversized_continuations_fail_closed() {
-    use state::Store;
-    let directory = std::env::temp_dir().join(format!("tinyllm-replay-{}", uuid::Uuid::new_v4()));
-    let store = Store::open(directory.clone(), 100_000, 8000).await.unwrap();
-    let mut blocks = Vec::new();
-    for _ in 0..2 {
-        let reference = Store::reference();
-        let native = upstream_response(
-            json!([{"type":"reasoning","id":"r","summary":[],"encrypted_content":"x".repeat(4400)}, {"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"done","annotations":[]}]}]),
-        );
-        let response = protocol::response(&native, "openai/gpt-test", &reference).unwrap();
-        let content = serde_json::to_value(response.content).unwrap();
-        store
-            .save(&reference, "gpt-test", &native, content.clone())
-            .await
-            .unwrap();
-        blocks.push(content);
-    }
+async fn missing_continuations_degrade_but_duplicates_and_limits_still_fail() {
+    let native = upstream_response(
+        json!([{"type":"reasoning","id":"r","summary":[],"encrypted_content":"x".repeat(4400)}, {"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"done","annotations":[]}]}]),
+    );
+    let content = serde_json::to_value(
+        protocol::response(&native, "openai/gpt-test")
+            .unwrap()
+            .content,
+    )
+    .unwrap();
     let mut req = request();
     req["messages"] = json!([{"role":"assistant","content":[{"type":"text","text":"done"}]}]);
-    assert!(
-        store
-            .restore(&req, "gpt-test")
-            .await
-            .unwrap_err()
-            .message
-            .contains("missing")
-    );
-    req["messages"] = json!([{"role":"assistant","content":blocks[0]},{"role":"user","content":"next"},{"role":"assistant","content":blocks[0]}]);
-    assert!(
-        store
-            .restore(&req, "gpt-test")
-            .await
-            .unwrap_err()
-            .message
-            .contains("duplicate")
-    );
-    req["messages"][2]["content"] = blocks[1].clone();
-    assert!(
-        store
-            .restore(&req, "gpt-test")
-            .await
-            .unwrap_err()
-            .message
-            .contains("exceeds")
-    );
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    let replay = protocol::request(&req, &model()).unwrap();
+    assert_eq!(replay["input"][1]["content"][0]["text"], "done");
+    // The same carrier replayed twice is history, not a conflict.
+    req["messages"] = json!([{"role":"assistant","content":content},{"role":"user","content":"next"},{"role":"assistant","content":content}]);
+    let replay = protocol::request(&req, &model()).unwrap();
+    let reasoning: Vec<_> = replay["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "reasoning")
+        .collect();
+    assert_eq!(reasoning.len(), 2);
+    assert_eq!(reasoning[0]["encrypted_content"], "x".repeat(4400));
 }
 
 #[tokio::test]
@@ -2222,10 +2490,16 @@ async fn subscription_json_stream_tools_reasoning_and_concurrency() {
     assert!(sse.contains("input_json_delta") && sse.contains("message_stop"));
     assert!(!sse.contains("event: error"));
     assert!(maximum.load(Ordering::SeqCst) >= 2);
+    let calls: Vec<_> = response["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|block| block["type"] == "tool_use")
+        .collect();
     let mut followup = request();
     followup["messages"].as_array_mut().unwrap().extend([
         json!({"role":"assistant","content":response["content"]}),
-        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"call_a","content":"ok"},{"type":"tool_result","tool_use_id":"call_b","is_error":true,"content":"denied"}]}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":calls[0]["id"],"content":"ok"},{"type":"tool_result","tool_use_id":calls[1]["id"],"is_error":true,"content":"denied"}]}),
         json!({"role":"system","content":"background notification"}),
     ]);
     assert_eq!(
@@ -2291,7 +2565,41 @@ async fn subscription_json_stream_tools_reasoning_and_concurrency() {
     gw_task.abort();
     up_task.abort();
     let _ = gw_task.await;
-    std::fs::remove_dir_all(directory).unwrap();
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn config_from_a_stateful_build_still_starts() {
+    use crate::config::Config;
+    let directory =
+        std::env::temp_dir().join(format!("tinyllm-legacy-cfg-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("config.toml");
+    std::fs::write(
+        &path,
+        r#"[server]
+bind = "127.0.0.1:8080"
+max_response_bytes = 33554432
+max_state_bytes = 268435456
+
+[server.state_cleanup]
+idle_days = 30
+interval_seconds = 3600
+
+[providers.openai]
+type = "openai"
+[providers.openai.auth]
+type = "ApiKey"
+options = "fixture-key"
+"#,
+    )
+    .unwrap();
+    // Removing the settings must not strand configs written by earlier builds.
+    let cfg = Config::load(&path).unwrap();
+    assert_eq!(cfg.server.max_response_bytes, 33_554_432);
+    assert!(cfg.server.obsolete_max_state_bytes.is_some());
+    assert!(cfg.server.obsolete_state_cleanup.is_some());
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 #[test]
@@ -2476,7 +2784,7 @@ providers:
     }
     std::fs::write(&path, "providers:\n  codex:\n    type: openai\n    auth:\n      type: Subscription\n    models:\n      alias:\n        id: gpt-test\n").unwrap();
     assert!(Config::load(&path).is_err());
-    std::fs::remove_dir_all(directory).unwrap();
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 #[test]
@@ -2484,7 +2792,7 @@ fn claude_controls_effort_and_format_over_server_defaults() {
     let mut req = request();
     req["thinking"] = json!({"type":"adaptive"});
     req["output_config"] = json!({"effort":"high","format":{"type":"json_schema","schema":{"type":"object","properties":{},"additionalProperties":false}}});
-    let out = protocol::request(&req, &model(), &Default::default()).unwrap();
+    let out = protocol::request(&req, &model()).unwrap();
     assert_eq!(out["reasoning"]["effort"], "high");
     assert_eq!(
         out["text"]["format"]["schema"],
@@ -2492,12 +2800,12 @@ fn claude_controls_effort_and_format_over_server_defaults() {
     );
     req["output_config"]["effort"] = json!("max");
     assert_eq!(
-        protocol::request(&req, &model(), &Default::default()).unwrap()["reasoning"]["effort"],
+        protocol::request(&req, &model()).unwrap()["reasoning"]["effort"],
         "max"
     );
     req["thinking"] = json!({"type":"disabled"});
     assert_eq!(
-        protocol::request(&req, &model(), &Default::default()).unwrap()["reasoning"]["effort"],
+        protocol::request(&req, &model()).unwrap()["reasoning"]["effort"],
         "none"
     );
 }
@@ -2642,15 +2950,11 @@ async fn openai_model_defaults_and_client_overrides_reach_each_endpoint() {
     task.abort();
     up_task.abort();
     let _ = task.await;
-    std::fs::remove_dir_all(directory).unwrap();
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 #[tokio::test]
 async fn local_command_acknowledgement_has_no_model_reasoning() {
-    use state::Store;
-    let directory = std::env::temp_dir().join(format!("tinyllm-ack-{}", uuid::Uuid::new_v4()));
-    let store = Store::open(directory.clone(), 10_000, 8000).await.unwrap();
-    assert!(Store::open(directory.clone(), 10_000, 8000).await.is_err());
     let mut req = request();
     req["messages"] = json!([
         {"role":"user","content":[{"type":"text","text":"<local-command-stdout>Compacted</local-command-stdout>"}]},
@@ -2658,8 +2962,7 @@ async fn local_command_acknowledgement_has_no_model_reasoning() {
         {"role":"assistant","content":[{"type":"text","text":"No response requested."}]},
         {"role":"user","content":"Continue"}
     ]);
-    let restored = store.restore(&req, "gpt-test").await.unwrap();
-    let out = protocol::request(&req, &model(), &restored).unwrap();
+    let out = protocol::request(&req, &model()).unwrap();
     assert_eq!(
         out["input"][3]["content"][0],
         json!({"type":"output_text","text":"No response requested."})
@@ -2667,10 +2970,8 @@ async fn local_command_acknowledgement_has_no_model_reasoning() {
     req["messages"].as_array_mut().unwrap().push(json!({
         "role":"assistant", "content":"No response requested."
     }));
-    assert!(store.restore(&req, "gpt-test").await.is_ok());
     req["messages"][0]["content"] = json!("an ordinary user message");
-    assert!(store.restore(&req, "gpt-test").await.is_err());
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    assert!(protocol::request(&req, &model()).is_ok());
 }
 
 #[tokio::test]
@@ -2749,14 +3050,12 @@ async fn live_sse_is_incremental_keeps_alive_and_never_finishes_failed_streams()
             "ended before completion"
         }));
     }
-    assert!(!std::fs::read_dir(&directory).unwrap().any(|entry| {
-        entry
-            .unwrap()
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == "json")
-    }));
+    // The gateway writes no conversation state, so nothing may be left behind.
+    assert!(
+        std::fs::read_dir(&directory)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    );
     gw_task.abort();
     up_task.abort();
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    let _ = tokio::fs::remove_dir_all(directory).await;
 }

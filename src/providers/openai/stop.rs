@@ -87,8 +87,11 @@ impl StopFilter {
                 self.text.drain(..safe);
                 events
             }
+            // Carrier blocks buffer with the text so a stop sequence can still
+            // span two messages separated by reasoning.
             StreamEvent::ContentBlockStart {
-                content_block: ContentBlockStart::Text { .. },
+                content_block:
+                    ContentBlockStart::Text { .. } | ContentBlockStart::RedactedThinking { .. },
                 ..
             }
             | StreamEvent::ContentBlockStop { .. } => {
@@ -222,9 +225,18 @@ impl StopFilter {
         let output = native["output"]
             .as_array_mut()
             .ok_or_else(|| Error::upstream("upstream output missing"))?;
-        let mut block_index = 1;
+        let mut block_index = 0;
         for (item_index, item) in output.iter_mut().enumerate() {
             match item["type"].as_str() {
+                // Mirrors the carrier blocks protocol::response emits.
+                Some("reasoning")
+                    if super::reasoning::capture(item)
+                        .as_ref()
+                        .and_then(super::reasoning::encode)
+                        .is_some() =>
+                {
+                    block_index += 1;
+                }
                 Some("message") => {
                     let parts = item["content"]
                         .as_array_mut()
@@ -265,7 +277,7 @@ impl StopFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::openai::{protocol, stream};
+    use crate::providers::openai::{protocol, reasoning, stream};
     use serde_json::json;
 
     fn response(parts: &[&str]) -> Value {
@@ -338,11 +350,24 @@ mod tests {
         ] {
             for fragmented in [false, true] {
                 let mut native = response(&parts);
-                let mut converted = protocol::response(&native, "openai/gpt-test", "ref").unwrap();
+                let mut converted = protocol::response(&native, "openai/gpt-test").unwrap();
                 let mut filter = StopFilter::new(&sequences).unwrap();
+                // The stream carries the same reasoning blocks the JSON response does.
+                let carriers: Vec<String> = native["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|item| {
+                        reasoning::capture(item)
+                            .as_ref()
+                            .and_then(reasoning::encode)
+                    })
+                    .collect();
                 let mut events = filter.push(StreamEvent::ContentBlockStart {
                     index: 0,
-                    content_block: ContentBlockStart::RedactedThinking { data: "ref".into() },
+                    content_block: ContentBlockStart::RedactedThinking {
+                        data: carriers[0].clone(),
+                    },
                 });
                 events.extend(filter.push(StreamEvent::ContentBlockStop { index: 0 }));
                 for (index, part) in parts.iter().enumerate() {
@@ -366,6 +391,14 @@ mod tests {
                     }
                     events.extend(filter.push(StreamEvent::ContentBlockStop { index }));
                 }
+                let trailing = parts.len() + 1;
+                events.extend(filter.push(StreamEvent::ContentBlockStart {
+                    index: trailing,
+                    content_block: ContentBlockStart::RedactedThinking {
+                        data: carriers[1].clone(),
+                    },
+                }));
+                events.extend(filter.push(StreamEvent::ContentBlockStop { index: trailing }));
                 events.extend(filter.finish());
                 filter.apply(&mut native, &mut converted).unwrap();
                 assert_eq!(
@@ -387,7 +420,7 @@ mod tests {
                 assert_eq!(converted.usage.output_tokens, 30);
                 let mut json_native = response(&parts);
                 let mut json_response =
-                    protocol::response(&json_native, "openai/gpt-test", "ref").unwrap();
+                    protocol::response(&json_native, "openai/gpt-test").unwrap();
                 let mut json_filter = StopFilter::new(&sequences).unwrap();
                 json_filter.json(&json_response);
                 json_filter
@@ -410,7 +443,7 @@ mod tests {
         native["output"].as_array_mut().unwrap().push(json!({
             "type":"message","id":"n","role":"assistant","content":[{"type":"output_text","text":"ock>hidden","annotations":[]}]
         }));
-        let mut converted = protocol::response(&native, "openai/gpt-test", "ref").unwrap();
+        let mut converted = protocol::response(&native, "openai/gpt-test").unwrap();
         let mut filter = StopFilter::new(&json!(["</block>"])).unwrap();
         filter.json(&converted);
         filter.apply(&mut native, &mut converted).unwrap();
@@ -429,7 +462,7 @@ mod tests {
             json!({"type":"message","id":"n","role":"assistant","content":[{"type":"output_text","text":"ock>","annotations":[]}]})
         ]);
         let expected = native.clone();
-        let mut converted = protocol::response(&native, "openai/gpt-test", "ref").unwrap();
+        let mut converted = protocol::response(&native, "openai/gpt-test").unwrap();
         let mut filter = StopFilter::new(&json!(["</block>"])).unwrap();
         filter.json(&converted);
         filter.apply(&mut native, &mut converted).unwrap();
@@ -443,7 +476,7 @@ mod tests {
         let mut native = response(&["denied</block>"]);
         native["status"] = json!("incomplete");
         native["incomplete_details"] = json!({"reason":"content_filter"});
-        let mut converted = protocol::response(&native, "openai/gpt-test", "ref").unwrap();
+        let mut converted = protocol::response(&native, "openai/gpt-test").unwrap();
         let mut filter = StopFilter::new(&json!(["</block>"])).unwrap();
         filter.json(&converted);
         filter.apply(&mut native, &mut converted).unwrap();

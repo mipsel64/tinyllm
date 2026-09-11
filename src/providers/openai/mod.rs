@@ -2,14 +2,13 @@ pub mod auth;
 mod compatible;
 pub mod models;
 pub mod protocol;
-pub mod state;
+pub mod reasoning;
 mod stop;
 pub mod stream;
 
 use self::{
     auth::Auth,
     models::{Config, Model},
-    state::Store,
 };
 use crate::{
     Result,
@@ -17,34 +16,27 @@ use crate::{
     error::Error,
     models::{
         ApiEvent, ApiFormat, ApiRequest, ModelInfo, ProviderOutput, RequestContext, ResponseBody,
+        anthropic::StreamEvent,
     },
     providers::{Provider, http, validate_effort},
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use futures::StreamExt;
 use serde_json::Value;
-use std::sync::Arc;
 
 pub struct OpenAiProvider {
     config: Config,
     server: Server,
-    store: Arc<Store>,
     client: reqwest::Client,
     auth: Auth,
 }
 
 impl OpenAiProvider {
-    pub fn new(
-        config: Config,
-        client: reqwest::Client,
-        server: Server,
-        store: Arc<Store>,
-    ) -> eyre::Result<Self> {
+    pub fn new(config: Config, client: reqwest::Client, server: Server) -> eyre::Result<Self> {
         let auth = Auth::open(&config.auth)?;
         Ok(Self {
             config,
             server,
-            store,
             client,
             auth,
         })
@@ -147,21 +139,11 @@ impl OpenAiProvider {
 
     async fn anthropic(&self, req: Value, context: RequestContext) -> Result<ProviderOutput> {
         let model = self.model(&context.model);
-        let mut state_pins = Vec::new();
-        let restored = self
-            .store
-            .restore_scoped_pinned(&req, &context.provider, &model.id, &mut state_pins)
-            .await?;
-        let continuation = if restored.is_empty() {
-            "fresh"
-        } else {
-            "restored"
-        };
+        let continuation = carrier_status(&req);
         let subscription = self.config.auth.is_subscription();
         let streaming = req["stream"] == true;
         let mut stops = stop::StopFilter::new(&req["stop_sequences"])?;
-        let defaults = state::tool_defaults(&req["tools"]);
-        let mut upstream_request = protocol::request(&req, &model, &restored)?;
+        let mut upstream_request = protocol::request(&req, &model)?;
         let search = upstream_request["tools"]
             .as_array()
             .is_some_and(|tools| tools.iter().any(|tool| tool["type"] == "web_search"));
@@ -199,8 +181,8 @@ impl OpenAiProvider {
             );
         }
         headers.insert("x-tinyllm-compatibility",HeaderValue::from_static(if subscription {
-            "anthropic-cache-hints-ignored; openai-automatic-caching; reasoning-reference-v1; subscription-max-tokens-unenforced"
-        } else { "anthropic-cache-hints-ignored; openai-automatic-caching; reasoning-reference-v1" }));
+            "anthropic-cache-hints-ignored; openai-automatic-caching; reasoning-carrier-v1; subscription-max-tokens-unenforced"
+        } else { "anthropic-cache-hints-ignored; openai-automatic-caching; reasoning-carrier-v1" }));
         if upstream_request["stream"] == true
             && !upstream
                 .headers()
@@ -210,14 +192,11 @@ impl OpenAiProvider {
         {
             return Err(Error::upstream("OpenAI did not return text/event-stream"));
         }
-        let reference = Store::reference();
-        state_pins.extend(self.store.pin(&reference).await?);
         let alias = context.public_model;
-        let mut translator = stream::Translator::new(alias.clone(), reference.clone());
+        let mut translator = stream::Translator::new(alias.clone());
         translator.sparse_completion = subscription;
         let body = if streaming {
             let decoded = stream::decode(upstream.bytes_stream(), self.server.max_response_bytes);
-            let store = self.store.clone();
             let events = async_stream::try_stream! {
                 futures::pin_mut!(decoded);
                 loop {
@@ -227,17 +206,16 @@ impl OpenAiProvider {
                         reject_citation_controls(native)?;
                     }
                     for event in events.into_iter().flat_map(|event| stops.push(event)) {
-                        yield ApiEvent::Anthropic(serde_json::to_value(event).map_err(|_| Error::upstream("cannot encode stream event"))?);
+                        yield anthropic_event(event)?;
                     }
                     if let Some(mut native) = translator.completed.take() {
-                        let mut response = protocol::response(&native,&alias,&reference).map_err(|mut e| {e.message=e.message.replace(&key,"[redacted]");e})?;
+                        let mut response = protocol::response(&native,&alias).map_err(|mut e| {e.message=e.message.replace(&key,"[redacted]");e})?;
                         for event in stops.finish() {
-                            yield ApiEvent::Anthropic(serde_json::to_value(event).map_err(|_| Error::upstream("cannot encode stream event"))?);
+                            yield anthropic_event(event)?;
                         }
                         stops.apply(&mut native, &mut response)?;
-                        store.save_scoped(&reference,&context.provider,&model.id,&native,serde_json::to_value(&response.content).map_err(|_| Error::upstream("cannot encode response content"))?,&defaults).await?;
                         tracing::info!(output_tokens=response.usage.output_tokens,"stream completed");
-                        for event in stream::finish(&response) { yield ApiEvent::Anthropic(serde_json::to_value(event).map_err(|_| Error::upstream("cannot encode stream event"))?); }
+                        for event in stream::finish(&response) { yield anthropic_event(event)?; }
                         break;
                     }
                 }
@@ -265,38 +243,44 @@ impl OpenAiProvider {
                 serde_json::from_slice(&data)
                     .map_err(|_| Error::upstream("OpenAI returned invalid JSON"))?
             };
-            let mut response =
-                protocol::response(&native, &alias, &reference).map_err(|mut e| {
-                    e.message = e.message.replace(&key, "[redacted]");
-                    e
-                })?;
+            let mut response = protocol::response(&native, &alias).map_err(|mut e| {
+                e.message = e.message.replace(&key, "[redacted]");
+                e
+            })?;
             if constrained_output {
                 reject_citation_controls(&native)?;
             }
             stops.json(&response);
             stops.apply(&mut native, &mut response)?;
-            self.store
-                .save_scoped(
-                    &reference,
-                    &context.provider,
-                    &model.id,
-                    &native,
-                    serde_json::to_value(&response.content)
-                        .map_err(|_| Error::upstream("cannot encode response content"))?,
-                    &defaults,
-                )
-                .await?;
-            ResponseBody::Json(
-                serde_json::to_value(response)
-                    .map_err(|_| Error::upstream("cannot encode response"))?,
-            )
+            let response = serde_json::to_value(response)
+                .map_err(|_| Error::upstream("cannot encode response"))?;
+            ResponseBody::Json(response)
         };
-        Ok(ProviderOutput {
-            headers,
-            body,
-            state_pins,
-        })
+        Ok(ProviderOutput { headers, body })
     }
+}
+
+/// Reports whether the replayed history carried resumable OpenAI reasoning.
+fn carrier_status(req: &Value) -> &'static str {
+    let carried = req["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| message["role"] == "assistant")
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .any(|block| {
+            block["type"] == "redacted_thinking"
+                && block["data"]
+                    .as_str()
+                    .is_some_and(|data| reasoning::decode(data).is_some())
+        });
+    if carried { "restored" } else { "fresh" }
+}
+
+fn anthropic_event(event: StreamEvent) -> Result<ApiEvent> {
+    let event =
+        serde_json::to_value(event).map_err(|_| Error::upstream("cannot encode stream event"))?;
+    Ok(ApiEvent::Anthropic(event))
 }
 
 fn reject_citation_controls(native: &Value) -> Result<()> {

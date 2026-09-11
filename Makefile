@@ -8,6 +8,7 @@ CONFIG := $(HOME)/.config/tinyllm/config.toml
 PLIST := $(HOME)/.config/tinyllm/tinyllm.plist
 LAUNCHD_PLIST := /Library/LaunchDaemons/io.github.mipsel64.tinyllm.plist
 LAUNCHD_SERVICE := system/io.github.mipsel64.tinyllm
+BOOTOUT_TIMEOUT ?= 680
 SYSTEMD_DIR := $(or $(XDG_CONFIG_HOME),$(HOME)/.config)/systemd/user
 
 .PHONY: build install setup restart status clean ensure-config ensure-os
@@ -71,9 +72,22 @@ ifeq ($(REBUILD),1)
 	$(MAKE) install
 endif
 ifeq ($(OS),Darwin)
-	@if launchctl print "$(LAUNCHD_SERVICE)" >/dev/null 2>&1; then \
-		sudo launchctl bootout "$(LAUNCHD_SERVICE)"; \
-	fi
+	@set -eu; \
+	if launchctl print "$(LAUNCHD_SERVICE)" >/dev/null 2>&1; then \
+		sudo launchctl bootout "$(LAUNCHD_SERVICE)" || true; \
+		waited=0; \
+		while launchctl print "$(LAUNCHD_SERVICE)" >/dev/null 2>&1; do \
+			if test "$$waited" -eq 0; then \
+				printf 'Waiting for %s to finish draining in-flight requests...\n' "$(LAUNCHD_SERVICE)" >&2; \
+			fi; \
+			if test "$$waited" -ge "$(BOOTOUT_TIMEOUT)"; then \
+				printf 'Still loaded after %ss; rerun make restart once it exits.\n' "$(BOOTOUT_TIMEOUT)" >&2; \
+				exit 1; \
+			fi; \
+			sleep 1; \
+			waited=$$((waited + 1)); \
+		done; \
+	fi; \
 	sudo launchctl bootstrap system "$(LAUNCHD_PLIST)"
 else ifeq ($(OS),Linux)
 	systemctl --user restart tinyllm.service

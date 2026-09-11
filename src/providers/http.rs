@@ -3,6 +3,7 @@ use crate::{
     config::Server,
     error::Error,
     models::{ApiEvent, ApiFormat, ApiRequest, ProviderOutput, RequestContext, ResponseBody},
+    providers::openai::reasoning,
 };
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
@@ -100,11 +101,7 @@ pub(crate) async fn forward(
     let format = request.format;
     let streaming = request.body.stream;
     let mut value = request.into_value();
-    if contains_reference(&value) {
-        return Err(Error::invalid(
-            "tinyllm reasoning references cannot be sent to another provider",
-        ));
-    }
+    strip_carriers(&mut value);
     if format == ApiFormat::Responses && value["background"] == true {
         return Err(Error::invalid(
             "background Responses require lifecycle endpoints that tinyllm does not expose",
@@ -193,26 +190,48 @@ pub(crate) async fn forward(
         public_model(&mut value, &context.public_model);
         ResponseBody::Json(value)
     };
-    Ok(ProviderOutput {
-        headers,
-        body,
-        state_pins: Vec::new(),
+    Ok(ProviderOutput { headers, body })
+}
+
+/// OpenAI reasoning carriers are provider-specific, so a model switch drops them
+/// instead of failing the replayed history. Only the two slots that can hold a
+/// carrier are touched, so tool arguments and JSON schemas are never rewritten.
+pub(crate) fn strip_carriers(value: &mut Value) {
+    for message in value
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+            blocks.retain(|block| !is_carrier(block));
+        }
+        if let Some(details) = message
+            .get_mut("reasoning_details")
+            .and_then(Value::as_array_mut)
+        {
+            details.retain(|detail| !is_carrier(detail));
+        }
+    }
+}
+
+/// Rejects carriers replayed as native Responses input, where they have no
+/// meaning. Scans only input items and their content parts.
+pub(crate) fn contains_carrier(value: &Value) -> bool {
+    value["input"].as_array().into_iter().flatten().any(|item| {
+        is_carrier(item)
+            || item["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(is_carrier))
     })
 }
 
-fn contains_reference(value: &Value) -> bool {
-    match value {
-        Value::Array(values) => values.iter().any(contains_reference),
-        Value::Object(values) => {
-            (value["type"] == "redacted_thinking"
-                && value["data"]
-                    .as_str()
-                    .is_some_and(|s| s.starts_with("tinyllm:v1:")))
-                || value["type"] == "tinyllm_continuation"
-                || values.values().any(contains_reference)
-        }
-        _ => false,
-    }
+fn is_carrier(value: &Value) -> bool {
+    (value["type"] == "redacted_thinking"
+        && value["data"]
+            .as_str()
+            .is_some_and(|data| data.starts_with(reasoning::PREFIX)))
+        || value["type"] == "tinyllm_continuation"
 }
 
 fn public_model(value: &mut Value, model: &str) {

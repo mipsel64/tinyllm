@@ -2,11 +2,11 @@ use crate::{
     Result,
     error::Error,
     models::anthropic::{AnthropicResponse, ResponseContent, Usage},
-    providers::openai::models::Model,
+    providers::openai::{models::Model, reasoning},
 };
 use base64::Engine;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 pub fn fields(value: &Value, allowed: &[&str]) -> Result<()> {
     let object = value
@@ -46,11 +46,10 @@ pub fn blocks(content: &Value) -> Result<Vec<Value>> {
     }
 }
 
-pub fn request(
-    req: &Value,
-    model: &Model,
-    restored: &BTreeMap<usize, Vec<Value>>,
-) -> Result<Value> {
+/// Continuation metadata written on assistant text by pre-carrier builds.
+const LEGACY_REFERENCE_FIELD: &str = "tinyllm_continuation";
+
+pub fn request(req: &Value, model: &Model) -> Result<Value> {
     fields(
         req,
         &[
@@ -114,104 +113,140 @@ pub fn request(
         .filter(|m| !m.is_empty())
         .ok_or_else(|| Error::invalid("messages must be a nonempty array"))?;
     let mut pending = HashSet::new();
+    let mut pending_client_calls = HashSet::new();
     let mut calls = HashSet::new();
     let mut loaded = HashSet::new();
-    for (index, message) in messages.iter().enumerate() {
+    for message in messages {
         fields(message, &["role", "content", "cache_control"])?;
         let role = string(message, "role")?;
         if !matches!(role, "user" | "assistant" | "system") {
             return Err(Error::invalid("unsupported message role"));
         }
-        let mut items = Vec::new();
-        if let Some(native) = restored.get(&index) {
-            if role != "assistant" {
-                return Err(Error::invalid(
-                    "continuation must be in an assistant message",
-                ));
-            }
-            items.extend(native.clone());
-        } else {
-            let mut parts = Vec::new();
-            for block in blocks(&message["content"])? {
-                match string(&block, "type")? {
-                    "text" | "image" => parts.extend(text_image_content(&json!([block]), role)?),
-                    "tool_use" if role == "assistant" => {
-                        flush(&mut items, &mut parts, role);
-                        fields(&block, &["type", "id", "name", "input", "cache_control"])?;
-                        let id = string(&block, "id")?;
-                        let name = string(&block, "name")?;
-                        valid_name(name)?;
-                        if !block["input"].is_object() {
-                            return Err(Error::invalid("tool input must be an object"));
-                        }
-                        items.push(json!({"type":"function_call","call_id":id,"name":name,"arguments":block["input"].to_string()}));
-                    }
-                    "tool_result" if role == "user" => {
-                        flush(&mut items, &mut parts, role);
-                        fields(
-                            &block,
-                            &[
-                                "type",
-                                "tool_use_id",
-                                "content",
-                                "is_error",
-                                "cache_control",
-                            ],
-                        )?;
-                        let is_error = match block.get("is_error") {
-                            None => false,
-                            Some(v) => v
-                                .as_bool()
-                                .ok_or_else(|| Error::invalid("is_error must be boolean"))?,
-                        };
-                        let mut output = match &block["content"] {
-                            Value::Null => json!(""),
-                            Value::String(_) => block["content"].clone(),
-                            Value::Array(_) => {
-                                let mut parts = Vec::new();
-                                for part in blocks(&block["content"])? {
-                                    if part["type"] == "tool_reference" {
-                                        fields(&part, &["type", "tool_name", "cache_control"])?;
-                                        let name = string(&part, "tool_name")?;
-                                        loaded.insert(name.to_owned());
-                                        let reference =
-                                            json!({"type":"tool_reference","tool_name":name});
-                                        parts.push(json!({"type":"input_text","text":reference.to_string()}));
-                                    } else {
-                                        parts.extend(text_image_content(&json!([part]), "user")?);
-                                    }
-                                }
-                                json!(parts)
-                            }
-                            v => json!(v.to_string()),
-                        };
-                        if is_error {
-                            if let Some(parts) = output.as_array_mut() {
-                                parts.insert(
-                                    0,
-                                    json!({"type":"input_text","text":"{\"is_error\":true}"}),
-                                );
-                            } else {
-                                output =
-                                    json!(json!({"is_error":true,"content":output}).to_string());
-                            }
-                        }
-                        items.push(json!({"type":"function_call_output","call_id":string(&block,"tool_use_id")?,"output":output}));
-                    }
-                    "thinking" | "redacted_thinking" => {
-                        return Err(Error::invalid(
-                            "capability_rejected: thinking; only tinyllm continuation references can be replayed, Anthropic thinking signatures are not OpenAI reasoning",
-                        ));
-                    }
-                    other => {
-                        return Err(Error::invalid(format!(
-                            "unsupported {role} content block: {other}"
-                        )));
-                    }
+        if role == "assistant" {
+            for block in message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|block| block["type"] == "tool_use")
+            {
+                let id = string(block, "id")?;
+                if id.is_empty() || !pending_client_calls.insert(id) {
+                    return Err(Error::invalid("empty or duplicate tool call ID"));
                 }
             }
-            flush(&mut items, &mut parts, role);
         }
+        let mut items = Vec::new();
+        let mut parts = Vec::new();
+        for mut block in blocks(&message["content"])? {
+            match string(&block, "type")? {
+                "text" | "image" => {
+                    // Sessions started before carriers tagged assistant text with
+                    // a continuation reference. Drop it rather than reject them.
+                    if let Some(object) = block.as_object_mut() {
+                        object.remove(LEGACY_REFERENCE_FIELD);
+                    }
+                    parts.extend(text_image_content(&json!([block]), role)?);
+                }
+                "tool_use" if role == "assistant" => {
+                    flush(&mut items, &mut parts, role);
+                    fields(&block, &["type", "id", "name", "input", "cache_control"])?;
+                    let id = string(&block, "id")?;
+                    let name = string(&block, "name")?;
+                    valid_name(name)?;
+                    if !block["input"].is_object() {
+                        return Err(Error::invalid("tool input must be an object"));
+                    }
+                    items.push(json!({"type":"function_call","call_id":id,"name":name,"arguments":block["input"].to_string()}));
+                }
+                "tool_result" if role == "user" => {
+                    flush(&mut items, &mut parts, role);
+                    fields(
+                        &block,
+                        &[
+                            "type",
+                            "tool_use_id",
+                            "content",
+                            "is_error",
+                            "cache_control",
+                        ],
+                    )?;
+                    let id = string(&block, "tool_use_id")?;
+                    if !pending_client_calls.remove(id) {
+                        return Err(Error::invalid(
+                            "tool result has no matching unresolved client tool call",
+                        ));
+                    }
+                    let is_error = match block.get("is_error") {
+                        None => false,
+                        Some(v) => v
+                            .as_bool()
+                            .ok_or_else(|| Error::invalid("is_error must be boolean"))?,
+                    };
+                    let mut output = match &block["content"] {
+                        Value::Null => json!(""),
+                        Value::String(_) => block["content"].clone(),
+                        Value::Array(_) => {
+                            let mut parts = Vec::new();
+                            for part in blocks(&block["content"])? {
+                                if part["type"] == "tool_reference" {
+                                    fields(&part, &["type", "tool_name", "cache_control"])?;
+                                    let name = string(&part, "tool_name")?;
+                                    loaded.insert(name.to_owned());
+                                    let reference =
+                                        json!({"type":"tool_reference","tool_name":name});
+                                    parts.push(
+                                        json!({"type":"input_text","text":reference.to_string()}),
+                                    );
+                                } else {
+                                    parts.extend(text_image_content(&json!([part]), "user")?);
+                                }
+                            }
+                            json!(parts)
+                        }
+                        v => json!(v.to_string()),
+                    };
+                    if is_error {
+                        if let Some(parts) = output.as_array_mut() {
+                            parts.insert(
+                                0,
+                                json!({"type":"input_text","text":"{\"is_error\":true}"}),
+                            );
+                        } else {
+                            output = json!(json!({"is_error":true,"content":output}).to_string());
+                        }
+                    }
+                    items.push(json!({"type":"function_call_output","call_id":id,"output":output}));
+                }
+                "thinking" if role == "assistant" => {
+                    fields(&block, &["type", "thinking", "signature", "cache_control"])?;
+                    string(&block, "thinking")?;
+                    if block
+                        .get("signature")
+                        .is_some_and(|value| !value.is_null() && !value.is_string())
+                    {
+                        return Err(Error::invalid("thinking signature must be a string"));
+                    }
+                }
+                "redacted_thinking" if role == "assistant" => {
+                    fields(&block, &["type", "data", "cache_control"])?;
+                    if let Some(replay) = reasoning::decode(string(&block, "data")?) {
+                        flush(&mut items, &mut parts, role);
+                        items.push(replay.item());
+                    }
+                }
+                "thinking" | "redacted_thinking" => {
+                    return Err(Error::invalid(
+                        "thinking blocks belong to assistant messages",
+                    ));
+                }
+                other => {
+                    return Err(Error::invalid(format!(
+                        "unsupported {role} content block: {other}"
+                    )));
+                }
+            }
+        }
+        flush(&mut items, &mut parts, role);
         for item in &items {
             match item["type"].as_str() {
                 Some("function_call") => {
@@ -231,7 +266,7 @@ pub fn request(
         }
         input.extend(items);
     }
-    if !pending.is_empty() {
+    if !pending.is_empty() || !pending_client_calls.is_empty() {
         return Err(Error::invalid("history has tool calls without results"));
     }
     out["input"] = json!(input);
@@ -579,7 +614,7 @@ fn flush(items: &mut Vec<Value>, parts: &mut Vec<Value>, role: &str) {
     }
 }
 
-fn valid_name(name: &str) -> Result<()> {
+pub(super) fn valid_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 64
         || !name
@@ -753,14 +788,11 @@ pub(super) fn citation_sources(response: &Value) -> Result<String> {
     Ok(sources)
 }
 
-pub fn response(response: &Value, alias: &str, reference: &str) -> Result<AnthropicResponse> {
+pub fn response(response: &Value, alias: &str) -> Result<AnthropicResponse> {
     if response["status"] == "failed" {
         return Err(Error::openai(response));
     }
-    let mut content = vec![ResponseContent::RedactedThinking {
-        content_type: "redacted_thinking".into(),
-        data: reference.into(),
-    }];
+    let mut content = Vec::new();
     let mut tool_use = false;
     let mut call_ids = HashSet::new();
     let mut refusal = false;
@@ -770,10 +802,14 @@ pub fn response(response: &Value, alias: &str, reference: &str) -> Result<Anthro
     {
         match item["type"].as_str() {
             Some("reasoning") => {
-                if item["encrypted_content"].as_str().is_none_or(str::is_empty) {
-                    return Err(Error::upstream(
-                        "reasoning output lacks encrypted continuation",
-                    ));
+                if let Some(data) = reasoning::capture(item)
+                    .as_ref()
+                    .and_then(reasoning::encode)
+                {
+                    content.push(ResponseContent::RedactedThinking {
+                        content_type: "redacted_thinking".into(),
+                        data,
+                    });
                 }
             }
             Some("message") => {

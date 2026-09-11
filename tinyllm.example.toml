@@ -22,34 +22,20 @@ bind = "127.0.0.1:8080"
 # Empty/whitespace tokens are invalid; omit the setting to disable it.
 # auth_token = "${TINYLLM_TOKEN:-}"
 
-# Private reasoning/continuation state and the default subscription auth folder.
-# Default: XDG_STATE_HOME/tinyllm when XDG_STATE_HOME is absolute, otherwise
-# HOME/.local/state/tinyllm. Keep it across restarts to resume conversations.
-# One running gateway may use this state directory at a time.
-# Continuations use state.sqlite; credentials remain in auth/openai.json.
-# On first startup, legacy continuation JSON files are imported and removed
-# after commit. Keep a backup before upgrading if you need to downgrade.
+# Default subscription auth folder. Default: XDG_STATE_HOME/tinyllm when
+# XDG_STATE_HOME is absolute, otherwise HOME/.local/state/tinyllm.
+# Credentials live in auth/openai.json. The gateway keeps no conversation
+# state: OpenAI reasoning travels with the client, so restarts and multiple
+# gateway instances resume conversations without shared storage.
 # state_dir = "/custom/state/tinyllm"
 
 # Maximum incoming JSON body, in bytes. Default: 8 MiB; must be positive.
 max_request_bytes = 8388608
 
-# Maximum upstream response, including total SSE bytes, and restored continuation
-# size, in bytes. Default: 32 MiB; must be positive. This is not a token limit.
+# Maximum upstream response, including total SSE bytes, in bytes.
+# Default: 32 MiB; must be positive. This is not a token limit.
 max_response_bytes = 33554432
 
-# Aggregate continuation payload budget, in bytes. Default: 256 MiB; must be at
-# least max_response_bytes. SQLite indexes, free pages and its temporary rollback
-# journal need additional disk space; status reports the database file separately.
-# Deleted pages are reused; the database is not routinely vacuumed.
-# A full store returns an error unless the optional
-# cleanup policy below can reclaim expired records. Credentials are separate.
-# Logs a warning at 80%. Inspect with tinyllm state status; stop the gateway and
-# preview tinyllm state prune --older-than-days 30 before adding --apply.
-# Deleted turns cannot resume. Access times track validated replays only when
-# cleanup is enabled. Otherwise prune uses creation or the last tracked access;
-# imported records retain their source file's modification time.
-max_state_bytes = 268435456
 
 # Optional global cap across inference endpoints, including active streams.
 # Omitted: no local cap; upstream limits apply. A positive value enables the cap
@@ -67,23 +53,6 @@ timeout_seconds = 600
 # Downstream SSE keep-alive interval, in seconds. Default: 10; must be positive.
 # Emits Anthropic ping events or OpenAI SSE comments; does not extend the timeout.
 keep_alive_seconds = 10
-
-# Optional automatic cleanup; omitting this section disables it.
-# Expiry uses the last validated replay (or creation for unused records).
-# Existing records get a full retention period when first enabled. Restarting
-# with cleanup enabled preserves that grace period; disabling resets it.
-# Active requests protect their records until their response completes or is
-# cancelled. Expired records are removed least-recently-used first; a full store
-# reclaims only enough expired, unpinned records for the pending save.
-# Last access is rounded up in five-minute windows to reduce writes; expiry can
-# be delayed by up to five minutes. Payloads are immutable; streaming events and
-# logs are never stored in SQLite. Empty cleanup sweeps do not write to it.
-# Auth and legacy temporary files are excluded from automatic cleanup.
-# Conversations idle beyond this period may no longer resume: start a new
-# conversation with a summary. Back up state if longer retention is required.
-# [server.state_cleanup]
-# idle_days = 30          # Default: 30 days; must be positive.
-# interval_seconds = 3600 # Default: hourly; must be positive. Also runs at startup.
 
 [logging]
 # tracing target filter on stderr. Default: tinyllm=info; dependencies stay quiet.
