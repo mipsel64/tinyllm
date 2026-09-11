@@ -481,7 +481,6 @@ impl Store {
                     return Err(Error::invalid("duplicate continuation reference"));
                 }
                 let id = Self::id(reference)?.to_owned();
-                // ponytail: reads queue behind writes; batch restores, then add readers if contention matters.
                 let used = self.used.clone().lock_owned().await;
                 let limit = self.record_limit;
                 let store = self.clone();

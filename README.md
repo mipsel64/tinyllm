@@ -107,18 +107,6 @@ upfront and uses more context. Experimental betas need no blanket disabling.
 Avoid `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: it disables Monitor.
 tinyllm does not change global Claude settings.
 
-OpenAI WebSearch supports `web_search_20250305`, bare-domain allow/block lists and
-approximate location. Answers include Markdown source links; native search state
-is preserved for continuation. With an API key, `max_uses` maps to the upstream
-`max_tool_calls` cap. Subscription access has no hard-cap parameter: the limit is
-best-effort through model instructions, with a warning and an
-`x-tinyllm-web-search` response header. Newer dynamic-filtering search versions,
-domain paths/wildcards and search combined with stop sequences or structured output
-are unsupported. Cited output cannot be combined with either output constraint.
-Citation conversion also applies when no search tool was declared. Failed or
-incomplete search attempts stay in native state without discarding an otherwise
-valid answer; whole-response failures still return errors.
-
 ### Connect other clients
 
 Use `http://127.0.0.1:8080/v1` as an OpenAI client's base URL, a prefixed model ID,
