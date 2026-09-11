@@ -1,4 +1,4 @@
-use super::protocol;
+use super::{protocol, reasoning};
 use crate::{Result, error::Error, models::anthropic::*};
 use bytes::Bytes;
 use eventsource_stream::Eventsource;
@@ -127,7 +127,6 @@ struct Item {
 
 pub struct Translator {
     alias: String,
-    reference: String,
     id: Option<String>,
     items: Vec<Item>,
     call_ids: HashSet<String>,
@@ -138,15 +137,14 @@ pub struct Translator {
 }
 
 impl Translator {
-    pub fn new(alias: String, reference: String) -> Self {
+    pub fn new(alias: String) -> Self {
         Self {
             alias,
-            reference,
             id: None,
             items: Vec::new(),
             call_ids: HashSet::new(),
             current: 0,
-            next_index: 1,
+            next_index: 0,
             completed: None,
             sparse_completion: false,
         }
@@ -185,13 +183,6 @@ impl Translator {
                     },
                 },
             });
-            events.push(StreamEvent::ContentBlockStart {
-                index: 0,
-                content_block: ContentBlockStart::RedactedThinking {
-                    data: self.reference.clone(),
-                },
-            });
-            events.push(StreamEvent::ContentBlockStop { index: 0 });
             return Ok(events);
         }
         if self.id.is_none() {
@@ -378,6 +369,17 @@ impl Translator {
                         }
                     }
                     "web_search_call" => protocol::web_search_output(final_item)?,
+                    "reasoning" => {
+                        if let Some(data) = reasoning::capture(final_item)
+                            .as_ref()
+                            .and_then(reasoning::encode)
+                        {
+                            let mut block =
+                                Block::new(ContentBlockStart::RedactedThinking { data });
+                            block.done = true;
+                            item.blocks.push(block);
+                        }
+                    }
                     _ => {}
                 }
                 item.complete = Some(final_item.clone());

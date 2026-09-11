@@ -16,7 +16,7 @@ background shells and subagents; tinyllm translates the API traffic.
 - Text, images, multiple tool calls and structured tool results.
 - MCP tools, including deferred ToolSearch, concurrent subagents and background shells through Claude Code.
 - Claude Code WebSearch through OpenAI native search, with domain filters and source links.
-- OpenAI reasoning continuation through tool calls, restarts and retained history after compaction.
+- OpenAI reasoning continuity through tool calls, restarts, model switches and compaction, with no gateway-side state.
 - Subscription login and automatic token refresh; per-model reasoning effort and OpenAI service tier defaults.
 
 Model access and native OpenRouter/Z.ai endpoint support depend on the upstream
@@ -133,7 +133,7 @@ From a source checkout, run these as your normal user:
 | `make restart` | Restart the service gracefully, without rebuilding. |
 | `make restart REBUILD=1` | Build, install, then restart. |
 | `make status` | Print the current launchd/systemd service status. |
-| `make clean` | Stop and remove the service and installed binary; keep config, credentials, state and logs. |
+| `make clean` | Stop and remove the service and installed binary; keep config, credentials and logs. |
 
 `setup` stops before building if `~/.config/tinyllm/config.toml` is missing and
 prints instructions to copy the example and fill the required provider/auth fields.
@@ -147,23 +147,18 @@ for boot startup, logs, persistent state and graceful shutdown. The image
 `ghcr.io/mipsel64/tinyllm` uses `nightly` and `main-<short-sha>` tags for main-branch
 builds, and the Git tag (such as `v0.1.0`) for releases.
 
-### Manage state
+### Credentials and reasoning continuity
 
-State defaults to `~/.local/state/tinyllm` (or `$XDG_STATE_HOME/tinyllm`).
-Default OpenAI credentials live at `auth/openai.json` beneath it. Keep the state
-directory to resume conversations; continuation records include plaintext
-assistant text and tool arguments. Only one gateway can use a state directory.
+`~/.local/state/tinyllm` (or `$XDG_STATE_HOME/tinyllm`) holds OpenAI credentials
+at `auth/openai.json`. Nothing else is stored there.
 
-The default continuation budget is 256 MiB, with no automatic eviction. Inspect
-usage with `tinyllm state status`. Stop the gateway before previewing cleanup:
-
-```sh
-tinyllm state prune --older-than-days 30
-```
-
-Add `--apply` to delete the selected records. Credentials are preserved, but
-deleted turns can no longer resume. Client compaction retains only the surviving
-history; missing continuation records produce an error.
+The gateway keeps no conversation state. OpenAI encrypted reasoning travels back
+to the client inside `redacted_thinking` blocks (Chat Completions uses
+`reasoning_details`), so restarts, model switches, subagents and multiple gateway
+instances all resume without shared storage. A carrier the gateway cannot read —
+a foreign signature, an older format, or one the client dropped — replays as
+plain history rather than failing the request. Switching to another provider
+drops the carriers, since encrypted reasoning is OpenAI-specific.
 
 MIT licensed. Adapted from [m0n0x41d/anthropic-proxy-rs](https://github.com/m0n0x41d/anthropic-proxy-rs/tree/59eb97bc3150106c18589fa5785102ae7be81caa);
 upstream and contributor attribution is preserved in [LICENSE](LICENSE).

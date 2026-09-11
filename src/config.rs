@@ -128,8 +128,19 @@ impl Config {
             }
         }
         let s = &self.server;
-        if let Some(cleanup) = s.state_cleanup {
-            cleanup.retention()?;
+        for name in [
+            s.obsolete_max_state_bytes
+                .as_ref()
+                .map(|_| "max_state_bytes"),
+            s.obsolete_state_cleanup.as_ref().map(|_| "state_cleanup"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            tracing::warn!(
+                setting = name,
+                "obsolete server setting ignored; tinyllm no longer stores continuations, so it can be deleted"
+            );
         }
         if s.max_concurrent_requests
             .is_some_and(|limit| !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&limit))
@@ -141,14 +152,11 @@ impl Config {
         }
         if s.max_request_bytes == 0
             || s.max_response_bytes == 0
-            || s.max_state_bytes < s.max_response_bytes as u64
             || s.request_body_timeout_seconds == 0
             || s.timeout_seconds == 0
             || s.keep_alive_seconds == 0
         {
-            bail!(
-                "limits and timeouts must be positive; max_state_bytes must cover one max_response_bytes"
-            );
+            bail!("limits and timeouts must be positive");
         }
         Ok(())
     }

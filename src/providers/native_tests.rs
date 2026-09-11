@@ -132,7 +132,7 @@ async fn provider_trait_maps_effort_for_the_selected_model() {
         }
     }
     drop(registry);
-    std::fs::remove_dir_all(directory).unwrap();
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 fn request(format: ApiFormat, model: &str, stream: bool) -> ApiRequest {
@@ -620,7 +620,7 @@ async fn dropping_native_stream_cancels_source_without_waiting_for_completion() 
 }
 
 #[tokio::test]
-async fn native_rejects_foreign_reasoning_before_network() {
+async fn native_strips_foreign_reasoning_carriers_before_network() {
     let server = Server::default();
     let client = http::client(&server).unwrap();
     let provider = zai::ZaiProvider::new(
@@ -633,37 +633,40 @@ async fn native_rejects_foreign_reasoning_before_network() {
         server,
     )
     .unwrap();
-    for block in [
-        json!({"type":"redacted_thinking","data":"tinyllm:v1:foreign-reference"}),
-        json!({"type":"text","text":"visible","tinyllm_continuation":"tinyllm:v1:foreign-reference"}),
-        json!({"type":"tool_use","id":"toolu_tinyllm_malformed","name":"lookup","input":{}}),
-        json!({"type":"tool_result","tool_use_id":"toolu_tinyllm_malformed","content":"ok"}),
-    ] {
-        let request = ApiRequest::parse(
-            ApiFormat::Anthropic,
-            json!({"model":"router/glm","messages":[{"role":"assistant","content":[block]}]}),
-        )
-        .unwrap();
-        let result = provider.execute(request, context("glm")).await;
-        assert_eq!(result.err().unwrap().status, StatusCode::BAD_REQUEST);
-    }
-    for (format, body) in [
+    // A model switch carries OpenAI reasoning into a provider that cannot read
+    // it. The carrier is dropped so the rest of the turn still forwards.
+    let request = ApiRequest::parse(
+        ApiFormat::Anthropic,
+        json!({"model":"router/glm","messages":[{"role":"assistant","content":[
+            {"type":"redacted_thinking","data":"tinyllm:v1:Zm9yZWlnbg:opaque"},
+            {"type":"text","text":"visible"}
+        ]}]}),
+    )
+    .unwrap();
+    let result = provider.execute(request, context("glm")).await;
+    // The upstream address is unroutable, so reaching the network is the proof
+    // that translation accepted the carrier instead of rejecting it.
+    assert_eq!(result.err().unwrap().status, StatusCode::BAD_GATEWAY);
+    for (format, body, status) in [
         (
             ApiFormat::Responses,
             json!({"model":"router/glm","background":true,"input":"hello"}),
+            StatusCode::BAD_REQUEST,
         ),
         (
             ApiFormat::Responses,
-            json!({"model":"router/glm","messages":[{"role":"assistant","reasoning_details":[{"type":"tinyllm_continuation","data":"tinyllm:v1:foreign-reference"}]}]}),
+            json!({"model":"router/glm","messages":[{"role":"assistant","reasoning_details":[{"type":"tinyllm_continuation","data":"tinyllm:v1:Zm9yZWlnbg:opaque"}]}]}),
+            StatusCode::BAD_GATEWAY,
         ),
         (
             ApiFormat::ChatCompletions,
-            json!({"model":"router/glm","messages":[{"role":"tool","tool_call_id":"toolu_tinyllm_malformed","content":"ok"}]}),
+            json!({"model":"router/glm","messages":[{"role":"tool","tool_call_id":"call_any","content":"ok"}]}),
+            StatusCode::BAD_GATEWAY,
         ),
     ] {
         let request = ApiRequest::parse(format, body).unwrap();
         let result = provider.execute(request, context("glm")).await;
-        assert_eq!(result.err().unwrap().status, StatusCode::BAD_REQUEST);
+        assert_eq!(result.err().unwrap().status, status);
     }
 }
 

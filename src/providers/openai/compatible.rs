@@ -1,4 +1,4 @@
-use super::{OpenAiProvider, state::Store};
+use super::{OpenAiProvider, reasoning};
 use crate::{
     Result,
     error::Error,
@@ -42,16 +42,13 @@ pub async fn execute(
     let subscription = provider.config.auth.is_subscription();
     let is_chat = format == ApiFormat::ChatCompletions;
     let include_usage = source["stream_options"]["include_usage"] == true;
-    let mut restored = false;
-    let mut state_pins = Vec::new();
+    let continuation = if is_chat {
+        carrier_status(&source)
+    } else {
+        "fresh"
+    };
     let mut body = if is_chat {
-        let history = request::history(&source)?;
-        let native = provider
-            .store
-            .restore_scoped_pinned(&history, &context.provider, &model.id, &mut state_pins)
-            .await?;
-        restored = !native.is_empty();
-        request::chat(&source, &model, subscription, &native)?
+        request::chat(&source, &model, subscription)?
     } else {
         request::native(source, &model, subscription)?
     };
@@ -72,14 +69,14 @@ pub async fn execute(
     if is_chat {
         headers.insert(
             "x-tinyllm-continuation",
-            HeaderValue::from_static(if restored { "restored" } else { "fresh" }),
+            HeaderValue::from_static(continuation),
         );
         headers.insert(
             "x-tinyllm-compatibility",
             HeaderValue::from_static(if subscription {
-                "chat-reasoning-details-reference-v1; subscription-max-tokens-unenforced"
+                "chat-reasoning-details-carrier-v1; subscription-max-tokens-unenforced"
             } else {
-                "chat-reasoning-details-reference-v1"
+                "chat-reasoning-details-carrier-v1"
             }),
         );
     }
@@ -92,14 +89,9 @@ pub async fn execute(
         return Err(Error::upstream("OpenAI did not return text/event-stream"));
     }
     let limit = provider.server.max_response_bytes;
-    let reference = Store::reference();
-    if is_chat {
-        state_pins.extend(provider.store.pin(&reference).await?);
-    }
     let public_model = context.public_model;
     let mut tracker = stream::Native::new(subscription);
     let body = if streaming {
-        let store = provider.store.clone();
         let decoded = super::stream::decode(upstream.bytes_stream(), limit);
         let mut chat = stream::Chat::new(public_model.clone());
         let events = async_stream::try_stream! {
@@ -116,8 +108,7 @@ pub async fn execute(
             }
             let native = tracker.finish()?;
             if is_chat {
-                let response = chat_response(&native, &public_model, &reference)?;
-                store.save_scoped(&reference, &context.provider, &model.id, &native, request::continuation(&response["choices"][0]["message"])?, &Default::default()).await?;
+                let response = chat_response(&native, &public_model)?;
                 for chunk in chat.finish(&response, include_usage)? { yield ApiEvent::ChatCompletions(chunk); }
                 yield ApiEvent::Done;
             }
@@ -146,19 +137,8 @@ pub async fn execute(
             value
         };
         if is_chat {
-            let response = chat_response(&native, &public_model, &reference)
-                .map_err(|error| redact(error, &key))?;
-            provider
-                .store
-                .save_scoped(
-                    &reference,
-                    &context.provider,
-                    &model.id,
-                    &native,
-                    request::continuation(&response["choices"][0]["message"])?,
-                    &Default::default(),
-                )
-                .await?;
+            let response =
+                chat_response(&native, &public_model).map_err(|error| redact(error, &key))?;
             ResponseBody::Json(response)
         } else {
             let mut native = native;
@@ -166,11 +146,27 @@ pub async fn execute(
             ResponseBody::Json(native)
         }
     };
-    Ok(ProviderOutput {
-        headers,
-        body,
-        state_pins,
-    })
+    Ok(ProviderOutput { headers, body })
+}
+
+/// Reports whether the replayed Chat history carried resumable OpenAI reasoning.
+fn carrier_status(source: &Value) -> &'static str {
+    let carried = source["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|message| {
+            message["reasoning_details"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .any(|detail| {
+            detail["data"]
+                .as_str()
+                .is_some_and(|data| reasoning::decode(data).is_some())
+        });
+    if carried { "restored" } else { "fresh" }
 }
 
 fn redact(mut error: Error, key: &str) -> Error {
@@ -217,8 +213,9 @@ fn validate_response(response: &Value) -> Result<()> {
     Ok(())
 }
 
-fn chat_response(response: &Value, model: &str, reference: &str) -> Result<Value> {
+fn chat_response(response: &Value, model: &str) -> Result<Value> {
     validate_response(response)?;
+    let mut carriers = Vec::new();
     let mut content = String::new();
     let mut refusal = String::new();
     let mut tools = Vec::new();
@@ -227,10 +224,11 @@ fn chat_response(response: &Value, model: &str, reference: &str) -> Result<Value
     for item in response["output"].as_array().unwrap() {
         match item["type"].as_str() {
             Some("reasoning") => {
-                if item["encrypted_content"].as_str().is_none_or(str::is_empty) {
-                    return Err(Error::upstream(
-                        "reasoning output lacks encrypted continuation",
-                    ));
+                if let Some(data) = reasoning::capture(item)
+                    .as_ref()
+                    .and_then(reasoning::encode)
+                {
+                    carriers.push(json!({"type":"tinyllm_continuation","data":data}));
                 }
             }
             Some("message") => {
@@ -327,7 +325,7 @@ fn chat_response(response: &Value, model: &str, reference: &str) -> Result<Value
     } else {
         "tool_calls"
     };
-    let mut message = json!({"role":"assistant","content":if content.is_empty() { Value::Null } else {json!(content)},"refusal":if refusal.is_empty() {Value::Null} else {json!(refusal)},"reasoning_details":[{"type":"tinyllm_continuation","data":reference}]});
+    let mut message = json!({"role":"assistant","content":if content.is_empty() { Value::Null } else {json!(content)},"refusal":if refusal.is_empty() {Value::Null} else {json!(refusal)},"reasoning_details":carriers});
     if !tools.is_empty() {
         message["tool_calls"] = json!(tools);
     }

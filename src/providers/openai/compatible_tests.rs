@@ -37,20 +37,17 @@ fn native_options_and_reasoning_are_preserved() {
 }
 
 #[test]
-fn native_responses_reject_all_gateway_reference_carriers() {
+fn native_responses_reject_all_gateway_reasoning_carriers() {
     for subscription in [false, true] {
         for item in [
-            json!({"role":"assistant","content":[{"type":"redacted_thinking","data":"tinyllm:v1:foreign"}]}),
-            json!({"role":"assistant","content":[{"type":"text","text":"visible","tinyllm_continuation":"tinyllm:v1:foreign"}]}),
-            json!({"type":"function_call","call_id":"toolu_tinyllm_malformed","name":"lookup","arguments":"{}"}),
-            json!({"type":"function_call_output","call_id":"toolu_tinyllm_malformed","output":"ok"}),
-            json!({"type":"tinyllm_continuation","data":"tinyllm:v1:foreign"}),
+            json!({"role":"assistant","content":[{"type":"redacted_thinking","data":"tinyllm:v1:Zm9yZWlnbg:opaque"}]}),
+            json!({"type":"tinyllm_continuation","data":"tinyllm:v1:Zm9yZWlnbg:opaque"}),
         ] {
             assert!(request::native(json!({"input":[item]}), &model(), subscription).is_err());
         }
         assert!(
             request::native(
-                json!({"input":"Discuss tinyllm_continuation and toolu_tinyllm_ as text", "text":{"format":{"type":"json_schema","name":"reply","schema":{"type":"object","properties":{"tinyllm_continuation":{"type":"string"}}}}}}),
+                json!({"input":"Discuss tinyllm_continuation as text", "text":{"format":{"type":"json_schema","name":"reply","schema":{"type":"object","properties":{"tinyllm_continuation":{"type":"string"}}}}}}),
                 &model(),
                 subscription
             )
@@ -62,8 +59,11 @@ fn native_responses_reject_all_gateway_reference_carriers() {
 #[test]
 fn chat_converts_roles_images_tools_and_rejects_unsupported_controls() {
     let original = json!({"model":"openai/gpt-native","messages":[{"role":"system","content":"system"},{"role":"developer","content":"developer"},{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"https://example.com/image.png","detail":"low"}}]}],"tools":[{"type":"function","function":{"name":"lookup","description":"lookup a value","parameters":{"type":"object"},"strict":false}}],"tool_choice":{"type":"function","function":{"name":"lookup"}},"response_format":{"type":"json_schema","json_schema":{"name":"reply","schema":{"type":"object"},"strict":true}},"reasoning_effort":"low","max_completion_tokens":20});
-    let converted = request::chat(&original, &model(), false, &Default::default()).unwrap();
+    let converted = request::chat(&original, &model(), false).unwrap();
+    assert_eq!(converted["input"][0]["content"][0]["type"], "input_text");
     assert_eq!(converted["input"][1]["role"], "developer");
+    assert_eq!(converted["input"][1]["content"][0]["type"], "input_text");
+    assert_eq!(converted["input"][2]["content"][0]["type"], "input_text");
     assert_eq!(converted["input"][2]["content"][1]["detail"], "low");
     assert_eq!(converted["tools"][0]["name"], "lookup");
     assert_eq!(
@@ -81,10 +81,7 @@ fn chat_converts_roles_images_tools_and_rejects_unsupported_controls() {
     ] {
         let mut invalid = original.clone();
         invalid[key] = value;
-        assert!(
-            request::chat(&invalid, &model(), false, &Default::default()).is_err(),
-            "{key}"
-        );
+        assert!(request::chat(&invalid, &model(), false).is_err(), "{key}");
     }
 }
 
@@ -92,39 +89,20 @@ fn completed(output: Value) -> Value {
     json!({"id":"resp_1","object":"response","created_at":123,"status":"completed","output":output,"usage":{"input_tokens":10,"output_tokens":7,"total_tokens":17,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}})
 }
 
-#[tokio::test]
-async fn chat_reference_roundtrip_restores_reasoning_and_two_tools() {
-    let directory = std::env::temp_dir().join(format!("tinyllm-chat-{}", uuid::Uuid::new_v4()));
-    let store = super::super::state::Store::open(directory.clone(), 1_000_000, 100_000)
-        .await
-        .unwrap();
+#[test]
+fn chat_carrier_roundtrip_replays_reasoning_and_two_tools() {
     let native = completed(
         json!([{"id":"rs_1","type":"reasoning","encrypted_content":"opaque","summary":[]},{"id":"fc_1","type":"function_call","call_id":"call_a","name":"lookup","arguments":"{\"x\":1}"},{"id":"fc_2","type":"function_call","call_id":"call_b","name":"lookup","arguments":"{\"x\":2}"}]),
     );
-    let reference = super::super::state::Store::reference();
-    let response = chat_response(&native, "openai/gpt-native", &reference).unwrap();
+    let response = chat_response(&native, "openai/gpt-native").unwrap();
     let message = response["choices"][0]["message"].clone();
-    store
-        .save(
-            &reference,
-            "gpt-native",
-            &native,
-            request::continuation(&message).unwrap(),
-        )
-        .await
-        .unwrap();
-    let mut streamed_message = message.clone();
-    streamed_message["content"] = json!("");
     assert_eq!(
-        request::continuation(&streamed_message).unwrap(),
-        request::continuation(&message).unwrap()
+        message["reasoning_details"][0]["type"],
+        "tinyllm_continuation"
     );
+
     let mut history = json!({"model":"openai/gpt-native","messages":[{"role":"user","content":"lookup both"},message,{"role":"tool","tool_call_id":"call_a","content":"first"},{"role":"tool","tool_call_id":"call_b","content":"second"}]});
-    let restored = store
-        .restore(&request::history(&history).unwrap(), "gpt-native")
-        .await
-        .unwrap();
-    let body = request::chat(&history, &model(), false, &restored).unwrap();
+    let body = request::chat(&history, &model(), false).unwrap();
     assert_eq!(body["input"][1], native["output"][0]);
     assert_eq!(body["input"][4]["call_id"], "call_a");
     assert_eq!(body["input"][5]["call_id"], "call_b");
@@ -132,20 +110,116 @@ async fn chat_reference_roundtrip_restores_reasoning_and_two_tools() {
         response["usage"]["prompt_tokens_details"]["cached_tokens"],
         3
     );
+
+    // A client that rewrites the assistant turn keeps replaying its reasoning.
     history["messages"][1]["tool_calls"][0]["function"]["arguments"] = json!("{}");
-    assert!(
-        store
-            .restore(&request::history(&history).unwrap(), "gpt-native")
-            .await
-            .is_err()
-    );
+    let body = request::chat(&history, &model(), false).unwrap();
+    assert_eq!(body["input"][1], native["output"][0]);
+    assert_eq!(body["input"][2]["arguments"], "{}");
+
+    // A client that drops the carrier degrades to portable history instead of failing.
     history["messages"][1]
         .as_object_mut()
         .unwrap()
         .remove("reasoning_details");
-    assert!(request::history(&history).is_err());
-    drop(store);
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    let body = request::chat(&history, &model(), false).unwrap();
+    assert_eq!(body["input"][1]["type"], "function_call");
+    assert_eq!(body["input"][1]["call_id"], "call_a");
+    assert_eq!(body["input"][3]["type"], "function_call_output");
+}
+
+#[test]
+fn chat_portable_history_preserves_visible_assistant_content_and_tools() {
+    let assistant = json!({
+        "role":"assistant",
+        "content":[{"type":"text","text":"visible"}],
+        "refusal":"declined",
+        "annotations":[{"type":"url_citation","url_citation":{"start_index":0,"end_index":7,"title":"source","url":"https://example.com"}}],
+        "tool_calls":[{"id":"call/raw","type":"function","function":{"name":"lookup","arguments":"{\"x\":1}"}}]
+    });
+    for details in [None, Some(Value::Null), Some(json!([]))] {
+        let mut assistant = assistant.clone();
+        if let Some(details) = details {
+            assistant["reasoning_details"] = details;
+        }
+        let body = request::chat(
+            &json!({"messages":[assistant,{"role":"tool","tool_call_id":"call/raw","content":[{"type":"text","text":"result"}]}]}),
+            &model(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            body["input"][0],
+            json!({"role":"assistant","content":[{"type":"output_text","text":"visible"},{"type":"refusal","refusal":"declined"}]})
+        );
+        assert_eq!(
+            body["input"][1],
+            json!({"type":"function_call","call_id":"call/raw","name":"lookup","arguments":"{\"x\":1}"})
+        );
+        assert_eq!(
+            body["input"][2],
+            json!({"type":"function_call_output","call_id":"call/raw","output":[{"type":"input_text","text":"result"}]})
+        );
+    }
+}
+
+#[test]
+fn chat_portable_history_rejects_malformed_assistant_fields_and_details() {
+    let rejected = |message: Value| {
+        assert!(request::chat(&json!({"messages":[message]}), &model(), false,).is_err());
+    };
+    for message in [
+        json!({"role":"assistant","content":"text","unknown":true}),
+        json!({"role":"assistant","content":1}),
+        json!({"role":"assistant","refusal":[]}),
+        json!({"role":"assistant","annotations":{}}),
+        json!({"role":"assistant","annotations":[null]}),
+        json!({"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":{}}}]}),
+        json!({"role":"assistant","reasoning_details":{}}),
+        json!({"role":"assistant","reasoning_details":[{"type":"foreign","data":"opaque"}]}),
+    ] {
+        rejected(message);
+    }
+}
+
+#[test]
+fn chat_portable_history_rejects_invalid_tool_pairing() {
+    let call = |id| json!({"role":"assistant","tool_calls":[{"id":id,"type":"function","function":{"name":"lookup","arguments":"{}"}}]});
+    assert!(
+        request::chat(
+            &json!({"messages":[call(""),{"role":"tool","tool_call_id":"","content":"result"}]}),
+            &model(),
+            false,
+        )
+        .is_err()
+    );
+    assert!(
+        request::chat(
+            &json!({"messages":[{"role":"assistant","tool_calls":[
+                {"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}},
+                {"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}
+            ]},{"role":"tool","tool_call_id":"call_1","content":"result"}]}),
+            &model(),
+            false,
+        )
+        .is_err()
+    );
+    assert!(
+        request::chat(
+            &json!({"messages":[{"role":"tool","tool_call_id":"call_1","content":"result"},call("call_1")]}),
+            &model(),
+            false,
+        )
+        .is_err()
+    );
+    assert!(
+        request::chat(
+            &json!({"messages":[call("call_1"),{"role":"tool","tool_call_id":"call_1","content":"result"},{"role":"tool","tool_call_id":"call_1","content":"duplicate"}]}),
+            &model(),
+            false,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -218,11 +292,17 @@ fn native_sse_rejects_removed_streamed_content() {
     assert!(tracker.accept(json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[]}})).is_err());
 }
 
+/// Replays `reasoning_details` carriers back into upstream Responses input items.
+fn replayed(details: &Value) -> Value {
+    let history =
+        json!({"messages":[{"role":"assistant","content":"x","reasoning_details":details}]});
+    request::chat(&history, &model(), false).unwrap()["input"][0].clone()
+}
+
 #[tokio::test]
 async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasoning() {
     use super::super::models::{Config, ModelOptions, OpenAiAuth, SubscriptionOptions};
     use axum::{Json, Router, response::IntoResponse, routing::post};
-    use std::sync::Arc;
     let reasoning =
         json!({"id":"rs_1","type":"reasoning","encrypted_content":"opaque","summary":[]});
     let events = [
@@ -276,11 +356,6 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
     let server = crate::config::Server::default();
-    let store = Arc::new(
-        Store::open(directory.join("state"), 1_000_000, 100_000)
-            .await
-            .unwrap(),
-    );
     let provider = OpenAiProvider::new(
         Config {
             base_url: base,
@@ -300,7 +375,6 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
         },
         http::client(&server).unwrap(),
         server,
-        store.clone(),
     )
     .unwrap();
     for format in [ApiFormat::Responses, ApiFormat::ChatCompletions] {
@@ -326,12 +400,7 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
                     } else {
                         assert_eq!(response["usage"]["prompt_tokens"], 3);
                         let message = response["choices"][0]["message"].clone();
-                        let history = request::history(&json!({"messages":[message]})).unwrap();
-                        let restored = store
-                            .restore_scoped(&history, "codex", "gpt-other")
-                            .await
-                            .unwrap();
-                        assert_eq!(restored[&0][0], reasoning);
+                        assert_eq!(replayed(&message["reasoning_details"]), reasoning);
                     }
                 }
                 ResponseBody::Stream(mut events) => {
@@ -353,18 +422,7 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
                             {
                                 let details = &value["choices"][0]["delta"]["reasoning_details"];
                                 assert!(details.is_array());
-                                let history = request::history(&json!({"messages":[{"role":"assistant","reasoning_details":details}]})).unwrap();
-                                let restored = store
-                                    .restore_scoped(&history, "codex", "gpt-other")
-                                    .await
-                                    .unwrap();
-                                assert_eq!(restored[&0][0], reasoning);
-                                assert!(
-                                    store
-                                        .restore_scoped(&history, "openai", "gpt-other")
-                                        .await
-                                        .is_err()
-                                );
+                                assert_eq!(replayed(details), reasoning);
                                 terminal = true;
                             }
                             _ => {}
@@ -382,9 +440,8 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
     .unwrap();
     assert!(execute(&provider, invalid, context()).await.is_err());
     drop(provider);
-    drop(store);
     task.abort();
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    let _ = tokio::fs::remove_dir_all(directory).await;
 }
 
 fn context() -> RequestContext {
@@ -423,7 +480,7 @@ fn subscription_string_input_becomes_one_user_message_without_changing_api_keys(
 #[test]
 fn chat_nullable_defaults_keep_client_reasoning_and_nonstrict_tools() {
     let body = json!({"messages":[{"role":"user","content":"hello"}],"reasoning_effort":null,"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"},"strict":null}}]});
-    let converted = request::chat(&body, &model(), false, &Default::default()).unwrap();
+    let converted = request::chat(&body, &model(), false).unwrap();
     assert_eq!(converted["reasoning"]["effort"], Value::Null);
     assert_eq!(converted["tools"][0]["strict"], false);
 }
@@ -432,17 +489,16 @@ fn chat_nullable_defaults_keep_client_reasoning_and_nonstrict_tools() {
 fn chat_usage_rejects_impossible_cache_or_reasoning_details() {
     let mut response = completed(json!([]));
     response["usage"]["input_tokens_details"]["cached_tokens"] = json!(11);
-    assert!(chat_response(&response, "codex/gpt-native", "tinyllm:v1:reference").is_err());
+    assert!(chat_response(&response, "codex/gpt-native").is_err());
     response["usage"]["input_tokens_details"]["cached_tokens"] = json!(0);
     response["usage"]["output_tokens_details"]["reasoning_tokens"] = json!(8);
-    assert!(chat_response(&response, "codex/gpt-native", "tinyllm:v1:reference").is_err());
+    assert!(chat_response(&response, "codex/gpt-native").is_err());
 }
 
 #[tokio::test]
 async fn api_key_chat_json_and_fragmented_sse_roundtrip_two_tools() {
     use super::super::models::{Config, OpenAiAuth};
     use axum::{Json, Router, body::Body, response::IntoResponse, routing::post};
-    use std::sync::Arc;
     let native = completed(json!([
         {"id":"rs_1","type":"reasoning","encrypted_content":"opaque","summary":[]},
         {"id":"fc_1","type":"function_call","call_id":"call_a","name":"lookup","arguments":"{\"x\":1}"},
@@ -502,11 +558,6 @@ async fn api_key_chat_json_and_fragmented_sse_roundtrip_two_tools() {
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let directory = std::env::temp_dir().join(format!("tinyllm-api-http-{}", uuid::Uuid::new_v4()));
     let server = crate::config::Server::default();
-    let store = Arc::new(
-        Store::open(directory.clone(), 1_000_000, 100_000)
-            .await
-            .unwrap(),
-    );
     let provider = OpenAiProvider::new(
         Config {
             base_url: base,
@@ -517,7 +568,6 @@ async fn api_key_chat_json_and_fragmented_sse_roundtrip_two_tools() {
         },
         http::client(&server).unwrap(),
         server,
-        store.clone(),
     )
     .unwrap();
     for streaming in [false, true] {
@@ -584,28 +634,25 @@ async fn api_key_chat_json_and_fragmented_sse_roundtrip_two_tools() {
             "{\"x\":1}"
         );
         assert_eq!(message["tool_calls"][1]["id"], "call_b");
-        let history = request::history(&json!({"messages":[message]})).unwrap();
-        let restored = store
-            .restore_scoped(&history, "codex", "gpt-native")
-            .await
-            .unwrap();
-        assert_eq!(restored[&0], expected["output"].as_array().unwrap().clone());
+        assert_eq!(
+            replayed(&message["reasoning_details"]),
+            expected["output"][0]
+        );
     }
     drop(provider);
-    drop(store);
     task.abort();
-    tokio::fs::remove_dir_all(directory).await.unwrap();
+    let _ = tokio::fs::remove_dir_all(directory).await;
 }
 
 #[test]
 fn chat_created_timestamp_is_an_integer_when_upstream_omits_it() {
     let mut response = completed(json!([]));
     assert_eq!(
-        chat_response(&response, "codex/gpt-native", "reference").unwrap()["created"],
+        chat_response(&response, "codex/gpt-native").unwrap()["created"],
         123
     );
     response.as_object_mut().unwrap().remove("created_at");
-    assert!(chat_response(&response, "codex/gpt-native", "reference").unwrap()["created"].is_u64());
+    assert!(chat_response(&response, "codex/gpt-native").unwrap()["created"].is_u64());
     let mut chat = stream::Chat::new("codex/gpt-native".into());
     assert!(
         chat.accept(&json!({"type":"response.created","response":{"id":"resp_1"}}))
@@ -613,5 +660,5 @@ fn chat_created_timestamp_is_an_integer_when_upstream_omits_it() {
             .is_u64()
     );
     response["created_at"] = json!("bad timestamp");
-    assert!(chat_response(&response, "codex/gpt-native", "reference").is_err());
+    assert!(chat_response(&response, "codex/gpt-native").is_err());
 }

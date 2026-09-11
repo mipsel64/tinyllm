@@ -26,7 +26,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 uuid = { version = "1", features = ["v4"] }
-rusqlite = { version = "0.40", default-features = false, features = ["bundled", "blob"] }
 
 [profile.release]
 lto = true

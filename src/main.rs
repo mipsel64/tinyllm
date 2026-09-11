@@ -52,21 +52,6 @@ enum Command {
         about = "Manage OpenAI subscription authentication"
     )]
     OpenAi(OpenAiCommand),
-    #[command(subcommand, about = "Inspect and explicitly prune continuation state")]
-    State(StateCommand),
-}
-
-#[derive(Subcommand)]
-enum StateCommand {
-    /// Report a snapshot of continuation file counts and bytes.
-    Status,
-    /// Preview old continuation files; stop the gateway before cleanup.
-    Prune {
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help = "Select files last modified more than N days ago")]
-        older_than_days: u64,
-        #[arg(long, help = "Delete selected files; pruned turns cannot resume")]
-        apply: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -99,9 +84,6 @@ async fn main() -> eyre::Result<()> {
         config.logging.format = format;
     }
     logging::init(&config.logging)?;
-    if let Some(Command::State(command)) = &cli.command {
-        return state_command(command, &config.server).await;
-    }
     if let Some(Command::OpenAi(command)) = cli.command {
         let prefix = match &command {
             OpenAiCommand::Login { provider, .. } | OpenAiCommand::Logout { provider } => provider,
@@ -159,61 +141,6 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-async fn state_command(command: &StateCommand, config: &config::Server) -> eyre::Result<()> {
-    use providers::openai::state::{DATABASE_FILE, Store};
-    println!("State: {}", config.state_dir.display());
-    match command {
-        StateCommand::Status => {
-            let usage = Store::status(&config.state_dir).await?;
-            print_usage("Snapshot", usage, config.max_state_bytes);
-            match tokio::fs::symlink_metadata(config.state_dir.join(DATABASE_FILE)).await {
-                Ok(metadata) if metadata.is_file() => println!(
-                    "SQLite file: {} bytes, including reusable free pages (journal excluded)",
-                    metadata.len()
-                ),
-                Ok(_) => eyre::bail!("state database must be a regular file"),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            if usage.is_high(config.max_state_bytes) {
-                eprintln!(
-                    "State is at least 80% full. Stop the gateway and preview tinyllm state prune before cleanup."
-                );
-            }
-        }
-        StateCommand::Prune {
-            older_than_days,
-            apply,
-        } => {
-            let seconds = older_than_days
-                .checked_mul(86_400)
-                .ok_or_else(|| eyre::eyre!("--older-than-days is too large"))?;
-            let cutoff = std::time::SystemTime::now()
-                .checked_sub(std::time::Duration::from_secs(seconds))
-                .ok_or_else(|| eyre::eyre!("--older-than-days is too large"))?;
-            eprintln!("Stop the gateway before cleanup. Pruned turns cannot resume.");
-            let report = Store::prune(&config.state_dir, cutoff, *apply).await?;
-            print_usage(
-                if *apply { "Removed" } else { "Preview" },
-                report.selected,
-                config.max_state_bytes,
-            );
-            print_usage("Remaining", report.after, config.max_state_bytes);
-            if !apply {
-                println!("No records removed. Repeat with --apply to delete the selection.");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn print_usage(label: &str, usage: providers::openai::state::Usage, limit: u64) {
-    println!(
-        "{label}: {} records, {} temporary files, {} / {limit} record bytes",
-        usage.records, usage.temporary_files, usage.bytes
-    );
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -244,90 +171,6 @@ mod tests {
                 _ => b.is_ascii_digit(),
             }));
         }
-    }
-
-    #[test]
-    fn cli_accepts_explicit_state_management() {
-        use super::{Cli, Command, StateCommand};
-        use clap::{Parser, error::ErrorKind};
-        assert!(matches!(
-            Cli::try_parse_from(["tinyllm", "state", "status"])
-                .unwrap()
-                .command,
-            Some(Command::State(StateCommand::Status))
-        ));
-        for apply in [false, true] {
-            let mut args = vec![
-                "tinyllm",
-                "state",
-                "-c",
-                "state.toml",
-                "prune",
-                "--older-than-days",
-                "30",
-            ];
-            if apply {
-                args.push("--apply");
-            }
-            let cli = Cli::try_parse_from(args).unwrap();
-            assert_eq!(
-                cli.config_path().unwrap(),
-                std::path::Path::new("state.toml")
-            );
-            assert!(
-                matches!(cli.command, Some(Command::State(StateCommand::Prune { older_than_days: 30, apply: selected })) if selected == apply)
-            );
-        }
-        for args in [
-            vec!["tinyllm", "state"],
-            vec!["tinyllm", "state", "status", "--apply"],
-            vec!["tinyllm", "state", "prune"],
-            vec!["tinyllm", "state", "prune", "--apply"],
-            vec!["tinyllm", "state", "prune", "--older-than-days"],
-        ] {
-            assert!(Cli::try_parse_from(args).is_err());
-        }
-        for days in ["0", "-1", "1.5", "many", "18446744073709551616"] {
-            assert!(
-                Cli::try_parse_from(["tinyllm", "state", "prune", "--older-than-days", days])
-                    .is_err()
-            );
-        }
-        for action in ["status", "prune"] {
-            assert_eq!(
-                Cli::try_parse_from(["tinyllm", "state", action, "--help"])
-                    .err()
-                    .unwrap()
-                    .kind(),
-                ErrorKind::DisplayHelp
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn state_prune_rejects_age_overflow_without_creating_state() {
-        let directory =
-            std::env::temp_dir().join(format!("tinyllm-cli-state-{}", uuid::Uuid::new_v4()));
-        let config = tinyllm::config::Server {
-            state_dir: directory.clone(),
-            ..Default::default()
-        };
-        for apply in [false, true] {
-            assert!(
-                super::state_command(
-                    &super::StateCommand::Prune {
-                        older_than_days: u64::MAX,
-                        apply
-                    },
-                    &config
-                )
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("too large")
-            );
-        }
-        assert!(!directory.exists());
     }
 
     #[test]
