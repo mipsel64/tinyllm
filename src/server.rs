@@ -1,7 +1,10 @@
 use crate::{
     config::Config,
     endpoints::{
-        Endpoint, anthropic::AnthropicEndpoint, endpoint::error_response, openai::OpenAiEndpoint,
+        Endpoint,
+        anthropic::{AnthropicEndpoint, HELLO_PATH},
+        endpoint::error_response,
+        openai::OpenAiEndpoint,
     },
     error::Error,
     models::ApiFormat,
@@ -73,6 +76,11 @@ fn format(request: &Request) -> ApiFormat {
 }
 
 async fn authenticate(State(app): State<Arc<AppState>>, request: Request, next: Next) -> Response {
+    // The preconnect probe carries no credentials and reveals nothing a refused
+    // request would not, so it runs before the token check.
+    if request.uri().path() == HELLO_PATH {
+        return next.run(request).await;
+    }
     let Some(expected) = app.config.server.auth_token.as_deref() else {
         return next.run(request).await;
     };

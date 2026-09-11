@@ -1911,6 +1911,44 @@ async fn http_auth_rejects_missing_and_invalid_client_credentials() {
         }
         assert_eq!(call.send().await.unwrap().status(), 401);
     }
+    // The preconnect probe is the one route that answers without credentials.
+    let hello = format!("{}/anthropic/api/hello", fixture.gateway);
+    for response in [
+        fixture.client.get(&hello).send().await.unwrap(),
+        fixture.client.head(&hello).send().await.unwrap(),
+        fixture
+            .client
+            .get(&hello)
+            .header("x-api-key", "wrong-token")
+            .send()
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(response.status(), 200);
+    }
+    // It must not reveal anything, and must not open any other route.
+    let body = fixture
+        .client
+        .get(&hello)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(body, r#"{"ok":true}"#);
+    for path in [
+        "/anthropic/v1/models",
+        "/anthropic/v1/messages/count_tokens",
+    ] {
+        let response = fixture
+            .client
+            .get(format!("{}{path}", fixture.gateway))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401, "{path} must stay authenticated");
+    }
     fixture.close().await;
 }
 

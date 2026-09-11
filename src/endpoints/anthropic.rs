@@ -16,10 +16,15 @@ use axum::{
 };
 use std::sync::Arc;
 
+/// Claude Code warms its connection pool against this before the first real
+/// call, without credentials, so it is served unauthenticated.
+pub const HELLO_PATH: &str = "/anthropic/api/hello";
+
 pub struct AnthropicEndpoint;
 impl Endpoint for AnthropicEndpoint {
     fn router(&self) -> Router<Arc<AppState>> {
         Router::new()
+            .route(HELLO_PATH, get(hello))
             .route("/anthropic/v1/messages", post(messages))
             .route(
                 "/anthropic/v1/messages/count_tokens",
@@ -27,6 +32,9 @@ impl Endpoint for AnthropicEndpoint {
             )
             .route("/anthropic/v1/models", get(models))
     }
+}
+async fn hello() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"ok": true}))
 }
 async fn messages(State(app): State<Arc<AppState>>, request: Request) -> Response {
     endpoint::execute(app, request, ApiFormat::Anthropic).await

@@ -121,6 +121,10 @@ and your local gateway token as its API key (`tinyllm` when auth is disabled).
 | Chat Completions | `POST /v1/chat/completions` | `GET /v1/models` |
 | Responses | `POST /v1/responses` | `GET /v1/models` |
 
+`GET /anthropic/api/hello` returns `{"ok":true}` and is the only route served
+without a gateway token: Claude Code warms its connection pool against it before
+sending credentials, and a refusal would reveal the same thing a reply does.
+
 ### Run as a service
 
 From a source checkout, run these as your normal user:
