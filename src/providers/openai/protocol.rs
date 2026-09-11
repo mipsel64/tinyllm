@@ -46,6 +46,14 @@ pub fn blocks(content: &Value) -> Result<Vec<Value>> {
     }
 }
 
+/// Lowers a requested effort to the model's configured ceiling, never raising it.
+/// Returns None when the request already sits at or below the ceiling.
+fn capped(requested: &str, model: &Model) -> Option<&'static str> {
+    let ceiling = model.max_reasoning_effort?;
+    let requested = crate::models::ReasoningEffort::parse(requested)?;
+    (requested > ceiling).then_some(ceiling.as_str())
+}
+
 /// Continuation metadata written on assistant text by pre-carrier builds.
 const LEGACY_REFERENCE_FIELD: &str = "tinyllm_continuation";
 
@@ -447,7 +455,11 @@ pub fn request(req: &Value, model: &Model) -> Result<Value> {
     }
     if let Some(effort) = effort {
         crate::providers::validate_effort(effort)?;
-        out["reasoning"] = json!({"effort":effort});
+        out["reasoning"] = json!({"effort":capped(effort, model).unwrap_or(effort)});
+    } else if let Some(ceiling) = model.max_reasoning_effort {
+        // No client choice to cap, but an unstated default can still exceed the
+        // ceiling upstream, so state it.
+        out["reasoning"] = json!({"effort":ceiling.as_str()});
     }
     for (key, max) in [("temperature", 2.0), ("top_p", 1.0)] {
         if let Some(value) = req.get(key) {
@@ -837,12 +849,15 @@ pub fn response(response: &Value, alias: &str) -> Result<AnthropicResponse> {
             }
             Some("web_search_call") => web_search_output(item)?,
             Some("function_call") => {
-                let input: Value = serde_json::from_str(
-                    item["arguments"]
-                        .as_str()
-                        .ok_or_else(|| Error::upstream("tool arguments missing"))?,
-                )
-                .map_err(|_| {
+                let arguments = item["arguments"]
+                    .as_str()
+                    .ok_or_else(|| Error::upstream("tool arguments missing"))?;
+                let name = item["name"].as_str().unwrap_or_default();
+                let arguments = super::tool_args::sanitize(name, arguments).map_or(
+                    std::borrow::Cow::Borrowed(arguments),
+                    std::borrow::Cow::Owned,
+                );
+                let input: Value = serde_json::from_str(&arguments).map_err(|_| {
                     Error::upstream(
                         "upstream returned incomplete or invalid tool JSON; tool was not executed",
                     )
@@ -877,6 +892,22 @@ pub fn response(response: &Value, alias: &str) -> Result<AnthropicResponse> {
             content_type: "text".into(),
             text: sources,
         });
+    }
+    // A completed turn carrying only reasoning is not something the client can
+    // act on, and as a success it would surface as the model silently saying
+    // nothing. Fail loudly instead.
+    // ponytail: errors rather than retrying; retry upstream if these turn out common.
+    if response["status"] == "completed"
+        && !content.iter().any(|block| {
+            matches!(
+                block,
+                ResponseContent::Text { .. } | ResponseContent::ToolUse { .. }
+            )
+        })
+    {
+        return Err(Error::upstream(
+            "upstream completed without any text or tool call; nothing to return",
+        ));
     }
     let reason = match response["status"].as_str() {
         Some("completed") => {

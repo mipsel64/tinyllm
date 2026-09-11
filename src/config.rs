@@ -128,16 +128,26 @@ impl Config {
             }
         }
         let s = &self.server;
-        if let Some(reviewer) = &s.auto_review_model {
-            // Resolved on every classifier subrequest, so a bad value here would
-            // break each one at dispatch time instead of at startup.
-            let (prefix, model) = reviewer
+        // Both are resolved per request, so a bad value must fail at startup
+        // rather than on every affected request.
+        let routable = |setting: &str, target: &str| -> Result<()> {
+            let (prefix, model) = target
                 .split_once('/')
-                .ok_or_else(|| eyre::eyre!("auto_review_model must be provider/native-model-id"))?;
+                .ok_or_else(|| eyre::eyre!("{setting} must be provider/native-model-id"))?;
             validate_model(model)?;
             if !self.providers.contains_key(prefix) {
-                bail!("auto_review_model names provider {prefix:?}, which is not configured");
+                bail!("{setting} names provider {prefix:?}, which is not configured");
             }
+            Ok(())
+        };
+        if let Some(reviewer) = &s.auto_review_model {
+            routable("auto_review_model", reviewer)?;
+        }
+        for (alias, target) in &s.model_aliases {
+            if alias.is_empty() {
+                bail!("model_aliases keys must not be empty");
+            }
+            routable("model_aliases", target)?;
         }
         for name in [
             s.obsolete_max_state_bytes

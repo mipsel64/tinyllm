@@ -19,6 +19,9 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct ModelOptions {
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Ceiling applied after the client's choice. Claude Code asks for high on
+    /// every turn, so a default alone cannot bring a model's effort down.
+    pub max_reasoning_effort: Option<ReasoningEffort>,
     pub service_tier: Option<ServiceTier>,
 }
 
@@ -86,4 +89,6 @@ pub struct Model {
     #[serde(default)]
     pub id: String,
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub max_reasoning_effort: Option<ReasoningEffort>,
 }

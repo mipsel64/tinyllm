@@ -87,6 +87,12 @@ async fn run(app: Arc<AppState>, request: Request, format: ApiFormat) -> crate::
         headers: Box::default(),
     })?;
     let mut request = ApiRequest::parse(format, value)?;
+    // Clients that hardcode an Anthropic model ID reach a configured target
+    // instead of an unknown-model error.
+    if let Some(target) = app.config.server.model_aliases.get(&request.body.model) {
+        tracing::debug!(alias = %request.body.model, target, "resolved model alias");
+        request.body.model = target.clone();
+    }
     if format == ApiFormat::Anthropic
         && let Some(reviewer) = app.config.server.auto_review_model.as_deref()
         && request.body.is_auto_review()

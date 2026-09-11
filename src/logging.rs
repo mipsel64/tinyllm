@@ -227,10 +227,10 @@ mod tests {
             (
                 "/anthropic/v1/messages/count_tokens",
                 "fixture-local-secret",
-                404,
-                "DEBUG",
-                "not_found_error",
-                "token counting is not supported",
+                400,
+                "WARN",
+                "invalid_request_error",
+                "count_tokens requires a JSON request body",
             ),
             (
                 "/anthropic/v1/messages/count_tokens/unknown",

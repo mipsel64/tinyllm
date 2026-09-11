@@ -20,7 +20,8 @@ pub enum ProviderConfig {
     Zai(zai::models::Config),
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+/// Ordered weakest to strongest so a configured ceiling can be compared.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     None,
@@ -44,6 +45,20 @@ impl ReasoningEffort {
             Self::Max => "max",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        [
+            Self::None,
+            Self::Minimal,
+            Self::Low,
+            Self::Medium,
+            Self::High,
+            Self::XHigh,
+            Self::Max,
+        ]
+        .into_iter()
+        .find(|level| level.as_str() == value)
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -58,6 +73,9 @@ pub struct Server {
     /// Routes Claude Code's permission-classifier subrequests to this
     /// provider/model. Unset leaves them on the session's model.
     pub auto_review_model: Option<String>,
+    /// Maps a client model ID onto a configured provider/model, so a client
+    /// that hardcodes an Anthropic name still routes somewhere.
+    pub model_aliases: BTreeMap<String, String>,
     pub request_body_timeout_seconds: u64,
     pub timeout_seconds: u64,
     pub keep_alive_seconds: u64,
@@ -79,6 +97,7 @@ impl Default for Server {
             max_response_bytes: 32 * 1024 * 1024,
             max_concurrent_requests: None,
             auto_review_model: None,
+            model_aliases: BTreeMap::new(),
             request_body_timeout_seconds: 30,
             timeout_seconds: 600,
             keep_alive_seconds: 10,

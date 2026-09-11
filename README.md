@@ -22,8 +22,10 @@ background shells and subagents; tinyllm translates the API traffic.
 Model access and native OpenRouter/Z.ai endpoint support depend on the upstream
 account. Unsupported semantic controls return explicit errors. OpenAI conversion
 does not support PDFs/audio, exact thinking budgets or Anthropic server compaction.
-Token counting is not implemented. Subscription mode does not enforce `max_tokens`
-and rejects temperature/top-p. Monitor availability remains unverified.
+Token counting is answered locally with `o200k_base` plus estimates for images
+and framing; it sizes context, it is not a billing count. Subscription mode does
+not enforce `max_tokens` and rejects temperature/top-p. Monitor availability
+remains unverified.
 
 ## How to use it
 
@@ -111,6 +113,12 @@ subrequest, which by default runs on the session's model — so a reasoning mode
 is asked to judge each Bash command before it runs. Set
 `server.auto_review_model` to a small fast model to make those checks quicker
 and cheaper.
+
+Claude Code asks for `high` reasoning effort on every turn, so a configured
+`reasoning_effort` cannot bring it down. `max_reasoning_effort` is a ceiling
+applied after the client's choice: it lowers a larger request and leaves a
+smaller one alone. `server.model_aliases` maps client model IDs such as
+`claude-sonnet-4-6` onto a configured provider/model.
 
 Set `CLAUDE_CODE_DISABLE_ARTIFACT=1` to prevent Claude Code from calling its hosted
 Artifact tool: gateway-token sessions cannot publish to Claude.ai Artifacts.
