@@ -2568,6 +2568,141 @@ async fn subscription_json_stream_tools_reasoning_and_concurrency() {
     let _ = std::fs::remove_dir_all(directory);
 }
 
+#[tokio::test]
+async fn auto_review_subrequests_reach_the_configured_reviewer() {
+    use axum::{Json, Router, routing::post};
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (upstream, up_task) = serve(Router::new().route(
+        "/responses",
+        post({
+            let seen = seen.clone();
+            move |Json(req): Json<Value>| {
+                seen.lock()
+                    .unwrap()
+                    .push(req["model"].as_str().unwrap_or_default().to_owned());
+                async move {
+                    Json(upstream_response(
+                        json!([{"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"allow","annotations":[]}]}]),
+                    ))
+                }
+            }
+        }),
+    ))
+    .await;
+    let directory = std::env::temp_dir().join(format!("tinyllm-review-{}", uuid::Uuid::new_v4()));
+    let mut cfg = config(upstream, directory.clone());
+    cfg.server.auto_review_model = Some("openai/gpt-reviewer".into());
+    let (gateway, task) = serve(crate::server::router(cfg).await.unwrap()).await;
+    let url = format!("{gateway}/anthropic/v1/messages");
+    let send = |body: Value| {
+        let url = url.clone();
+        async move {
+            reqwest::Client::new()
+                .post(&url)
+                .bearer_auth("local-secret")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    let monitor = "You are a security monitor for autonomous AI coding agents.\n\n## Context";
+    assert_eq!(
+        send(
+            json!({"model":"openai/gpt-test","max_tokens":512,"system":monitor,
+                    "messages":[{"role":"user","content":"rm -rf /"}]})
+        )
+        .await,
+        200
+    );
+    // An ordinary turn must stay on the session's model.
+    assert_eq!(
+        send(
+            json!({"model":"openai/gpt-test","max_tokens":512,"system":"You are Claude Code.",
+                    "messages":[{"role":"user","content":"hello"}]})
+        )
+        .await,
+        200
+    );
+    task.abort();
+    up_task.abort();
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        ["gpt-reviewer", "gpt-test"],
+        "only the classifier is rerouted"
+    );
+    let _ = tokio::fs::remove_dir_all(directory).await;
+}
+
+#[test]
+fn auto_review_detection_needs_all_three_signals() {
+    use crate::models::request::RequestBody;
+    let monitor = "You are a security monitor for autonomous AI coding agents.\n\n## Context";
+    let body = |value: Value| serde_json::from_value::<RequestBody>(value).unwrap();
+
+    for system in [json!(monitor), json!([{"type":"text","text":monitor}])] {
+        assert!(
+            body(json!({"model":"openai/gpt-test","system":system})).is_auto_review(),
+            "system as {system}"
+        );
+    }
+    // Streaming, tools, or an ordinary system prompt each rule it out; a normal
+    // Claude Code turn has all three and must never be rerouted.
+    for value in [
+        json!({"model":"openai/gpt-test","system":monitor,"stream":true}),
+        json!({"model":"openai/gpt-test","system":monitor,"tools":[{"name":"Bash"}]}),
+        json!({"model":"openai/gpt-test","system":"You are Claude Code."}),
+        json!({"model":"openai/gpt-test"}),
+        json!({"model":"openai/gpt-test","system":[{"type":"text","text":"You are Claude Code."}]}),
+    ] {
+        assert!(!body(value.clone()).is_auto_review(), "{value}");
+    }
+    // An empty tools array is still tool-free.
+    assert!(body(json!({"model":"openai/gpt-test","system":monitor,"tools":[]})).is_auto_review());
+}
+
+#[test]
+fn auto_review_model_must_name_a_configured_provider() {
+    use crate::config::Config;
+    let directory =
+        std::env::temp_dir().join(format!("tinyllm-review-cfg-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("config.toml");
+    let write = |reviewer: &str| {
+        std::fs::write(
+            &path,
+            format!(
+                r#"[server]
+auto_review_model = "{reviewer}"
+[providers.openai]
+type = "openai"
+[providers.openai.auth]
+type = "ApiKey"
+options = "fixture-key"
+"#
+            ),
+        )
+        .unwrap();
+    };
+    write("openai/gpt-5.6-luna");
+    assert_eq!(
+        Config::load(&path)
+            .unwrap()
+            .server
+            .auto_review_model
+            .unwrap(),
+        "openai/gpt-5.6-luna"
+    );
+    // A typo must fail at startup, not on every classifier subrequest.
+    for reviewer in ["gpt-5.6-luna", "codex/gpt-5.6-luna", "openai/"] {
+        write(reviewer);
+        assert!(Config::load(&path).is_err(), "{reviewer}");
+    }
+    let _ = std::fs::remove_dir_all(directory);
+}
+
 #[test]
 fn config_from_a_stateful_build_still_starts() {
     use crate::config::Config;

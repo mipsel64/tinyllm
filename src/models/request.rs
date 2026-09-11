@@ -19,7 +19,38 @@ pub struct RequestBody {
     pub fields: Map<String, Value>,
 }
 
+/// Claude Code checks each tool call for risky actions and prompt injection by
+/// sending this subrequest to the session's model.
+const AUTO_REVIEW_SYSTEM_PREFIX: &str =
+    "You are a security monitor for autonomous AI coding agents.";
+
 impl RequestBody {
+    /// Recognises that permission-classifier subrequest: non-streaming, no
+    /// tools, and the monitor system prompt. It wants a short verdict, so a
+    /// small model answers it faster and more predictably than a reasoning one.
+    pub fn is_auto_review(&self) -> bool {
+        if self.stream {
+            return false;
+        }
+        if self
+            .fields
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+        {
+            return false;
+        }
+        match self.fields.get("system") {
+            Some(Value::String(text)) => text.starts_with(AUTO_REVIEW_SYSTEM_PREFIX),
+            Some(Value::Array(blocks)) => blocks.iter().any(|block| {
+                block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(AUTO_REVIEW_SYSTEM_PREFIX))
+            }),
+            _ => false,
+        }
+    }
+
     pub fn default_effort(&mut self, container: Option<&str>, effort: &str) {
         let fields = &mut self.fields;
         if fields.contains_key("reasoning_effort")
