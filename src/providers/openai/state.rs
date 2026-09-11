@@ -1,7 +1,8 @@
 use crate::{Result, error::Error, models::config::StateCleanup, providers::openai::protocol};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use eyre::WrapErr;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
@@ -16,6 +17,99 @@ pub use sqlite::FILE as DATABASE_FILE;
 use sqlite::{Database, Loaded};
 
 pub const PREFIX: &str = "tinyllm:v1:";
+pub(crate) const REFERENCE_FIELD: &str = "tinyllm_continuation";
+pub(crate) const TOOL_PREFIX: &str = "toolu_tinyllm_";
+const MAX_TOOL_ID_BYTES: usize = 1024;
+
+pub(super) fn encode_tool_id(reference: &str, id: &str) -> Result<String> {
+    let reference = Store::id(reference)?;
+    if id.is_empty() || id.len() > MAX_TOOL_ID_BYTES {
+        return Err(Error::upstream("tool call ID must contain 1–1024 bytes"));
+    }
+    Ok(format!(
+        "{TOOL_PREFIX}{reference}_{}",
+        URL_SAFE_NO_PAD.encode(id)
+    ))
+}
+
+pub(super) fn decode_tool_id(id: &str) -> Result<Option<(String, String)>> {
+    let Some(encoded) = id.strip_prefix(TOOL_PREFIX) else {
+        return Ok(None);
+    };
+    let invalid = || Error::invalid("invalid tinyllm tool call ID");
+    if encoded.len() > 33 + MAX_TOOL_ID_BYTES.div_ceil(3) * 4 {
+        return Err(invalid());
+    }
+    let (uuid, encoded) = encoded.split_once('_').ok_or_else(invalid)?;
+    let reference = format!("{PREFIX}{uuid}");
+    Store::id(&reference)?;
+    let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| invalid())?;
+    if bytes.is_empty()
+        || bytes.len() > MAX_TOOL_ID_BYTES
+        || URL_SAFE_NO_PAD.encode(&bytes) != encoded
+    {
+        return Err(invalid());
+    }
+    let native = String::from_utf8(bytes).map_err(|_| invalid())?;
+    Ok(Some((reference, native)))
+}
+
+pub(super) fn mark_block(block: &mut Value, reference: &str) -> Result<()> {
+    match block["type"].as_str() {
+        Some("text") => block[REFERENCE_FIELD] = json!(reference),
+        Some("tool_use") => {
+            block["id"] = json!(encode_tool_id(reference, protocol::string(block, "id")?)?);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn block_reference(block: &Value) -> Result<Option<(String, Option<String>)>> {
+    if block.get(REFERENCE_FIELD).is_some() && block["type"] != "text" {
+        return Err(Error::invalid(
+            "continuation metadata must be on a text block",
+        ));
+    }
+    let reference = match block["type"].as_str() {
+        Some("redacted_thinking") => protocol::string(block, "data")?,
+        Some("text") if block.get(REFERENCE_FIELD).is_some() => {
+            protocol::string(block, REFERENCE_FIELD)?
+        }
+        Some("tool_use") => {
+            return Ok(decode_tool_id(protocol::string(block, "id")?)?
+                .map(|(reference, id)| (reference, Some(id))));
+        }
+        _ => return Ok(None),
+    };
+    Store::id(reference)?;
+    Ok(Some((reference.to_owned(), None)))
+}
+
+fn normalize_content(content: Vec<Value>) -> Result<Vec<Value>> {
+    let mut normalized = Vec::with_capacity(content.len());
+    let mut current = None;
+    for mut block in content {
+        if let Some((reference, native_id)) = block_reference(&block)? {
+            if block["type"] == "redacted_thinking" {
+                current = Some(reference);
+                normalized.push(block);
+                continue;
+            }
+            if let Some(id) = native_id {
+                block["id"] = json!(id);
+            } else {
+                block.as_object_mut().unwrap().remove(REFERENCE_FIELD);
+            }
+            if current.as_ref() != Some(&reference) {
+                normalized.push(json!({"type":"redacted_thinking","data":reference}));
+                current = Some(reference);
+            }
+        }
+        normalized.push(block);
+    }
+    Ok(normalized)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
@@ -52,6 +146,8 @@ pub struct PruneReport {
 
 #[derive(Serialize, Deserialize)]
 struct Record {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
     model: String,
     output: Vec<Value>,
     content: Vec<Value>,
@@ -262,7 +358,7 @@ impl Store {
         response: &Value,
         content: Value,
     ) -> Result<()> {
-        self.save_with_defaults(reference, model, response, content, &BTreeMap::new())
+        self.save_with_defaults(reference, model, None, response, content, &BTreeMap::new())
             .await
     }
 
@@ -270,6 +366,7 @@ impl Store {
         &self,
         reference: &str,
         model: &str,
+        provider: Option<&str>,
         response: &Value,
         content: Value,
         defaults: &BTreeMap<String, BTreeMap<String, Value>>,
@@ -290,6 +387,7 @@ impl Store {
             }
         }
         let record = Record {
+            provider: provider.map(str::to_owned),
             model: model.into(),
             output: response["output"]
                 .as_array()
@@ -344,6 +442,7 @@ impl Store {
         self.save_with_defaults(
             reference,
             &format!("{provider}/{model}"),
+            Some(provider),
             response,
             content,
             defaults,
@@ -368,13 +467,7 @@ impl Store {
         model: &str,
         pins: &mut Vec<Arc<()>>,
     ) -> Result<BTreeMap<usize, Vec<Value>>> {
-        self.restore_for(
-            request,
-            &format!("{provider}/{model}"),
-            (provider == "openai").then_some(model),
-            pins,
-        )
-        .await
+        self.restore_for(request, provider, model, pins).await
     }
 
     #[cfg(test)]
@@ -383,15 +476,15 @@ impl Store {
         request: &Value,
         model: &str,
     ) -> Result<BTreeMap<usize, Vec<Value>>> {
-        self.restore_for(request, model, None, &mut Vec::new())
+        self.restore_for(request, "openai", model, &mut Vec::new())
             .await
     }
 
     async fn restore_for(
         &self,
         request: &Value,
+        provider: &str,
         model: &str,
-        legacy_model: Option<&str>,
         pins: &mut Vec<Arc<()>>,
     ) -> Result<BTreeMap<usize, Vec<Value>>> {
         let mut restored = BTreeMap::new();
@@ -403,15 +496,19 @@ impl Store {
         if self.cleanup.is_some() {
             let mut used = self.used.lock().await;
             used.pins.retain(|_, pin| pin.strong_count() > 0);
+            let mut pinned = HashSet::new();
             for block in messages
                 .iter()
                 .filter(|message| message["role"] == "assistant")
                 .filter_map(|message| message["content"].as_array())
                 .flatten()
-                .filter(|block| block["type"] == "redacted_thinking")
             {
-                let id = Self::id(protocol::string(block, "data")?)?.to_owned();
-                pins.push(Self::pin_locked(&mut used, id));
+                if let Some((reference, _)) = block_reference(block)? {
+                    let id = Self::id(&reference)?.to_owned();
+                    if pinned.insert(id.clone()) {
+                        pins.push(Self::pin_locked(&mut used, id));
+                    }
+                }
             }
         }
         let mut index = 0;
@@ -440,15 +537,18 @@ impl Store {
                 content.extend(protocol::blocks(&messages[index]["content"])?);
                 index += 1;
             }
+            // A copied fork call may refer to an unfinished parent response.
+            if !content.iter().any(|b| b["type"] == "redacted_thinking")
+                && is_fork_bootstrap(&content, messages.get(index))
+            {
+                tracing::debug!(
+                    assistant_message_index = first,
+                    "Claude fork reasoning boundary"
+                );
+                continue;
+            }
+            let mut content = normalize_content(content)?;
             if !content.iter().any(|b| b["type"] == "redacted_thinking") {
-                // Claude's explicit worker bootstrap starts a new reasoning context.
-                if is_fork_bootstrap(&content, messages.get(index)) {
-                    tracing::debug!(
-                        assistant_message_index = first,
-                        "Claude fork reasoning boundary"
-                    );
-                    continue;
-                }
                 // Claude Code repeats this acknowledgement when resuming local commands.
                 if local_command
                     && content.len() == 1
@@ -458,6 +558,24 @@ impl Store {
                     protocol::fields(&content[0], &["type", "text", "cache_control"])?;
                     continue;
                 }
+                let block_types: Vec<_> = content
+                    .iter()
+                    .take(8)
+                    .map(|block| match block["type"].as_str() {
+                        Some("text") => "text",
+                        Some("tool_use") => "tool_use",
+                        Some("thinking") => "thinking",
+                        _ => "other",
+                    })
+                    .collect();
+                tracing::warn!(
+                    provider,
+                    model,
+                    assistant_message_index = first,
+                    block_count = content.len(),
+                    ?block_types,
+                    "assistant history lacks a continuation reference"
+                );
                 return Err(Error::invalid(
                     "assistant history is missing tinyllm continuation references; imported histories or stripped references cannot preserve native reasoning; start a new conversation with a user summary",
                 ));
@@ -511,9 +629,20 @@ impl Store {
                     .iter()
                     .position(|b| b["type"] == "redacted_thinking")
                     .map_or(content.len(), |p| start + 1 + p);
-                if record.model != model && legacy_model != Some(record.model.as_str()) {
+                let saved_provider = match record.provider.as_deref() {
+                    Some(provider) => provider,
+                    None if !record.model.contains('/') || record.model.starts_with("openai/") => {
+                        "openai"
+                    }
+                    None => {
+                        return Err(Error::invalid(
+                            "legacy continuation has ambiguous provider scope; start a new conversation",
+                        ));
+                    }
+                };
+                if saved_provider != provider {
                     return Err(Error::invalid(
-                        "continuation model changed; keep its model mapping or start a new conversation",
+                        "continuation provider changed; keep its provider or start a new conversation",
                     ));
                 }
                 // Claude Code materializes omitted tool defaults before replaying calls.
@@ -762,6 +891,197 @@ fn warn_if_high(usage: Usage, limit: u64) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tool_reference_codec_is_bounded_canonical_and_reversible() {
+        let reference = Store::reference();
+        let nested = encode_tool_id(&Store::reference(), "native").unwrap();
+        for native in [
+            "call_abcdefghijklmnopqrstuvwxyz012345".to_owned(),
+            "tool/🦀".to_owned(),
+            "x".repeat(MAX_TOOL_ID_BYTES),
+            nested,
+        ] {
+            let id = encode_tool_id(&reference, &native).unwrap();
+            assert!(
+                id.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            );
+            assert_eq!(
+                decode_tool_id(&id).unwrap(),
+                Some((reference.clone(), native))
+            );
+        }
+        assert!(decode_tool_id("call_native").unwrap().is_none());
+        assert!(encode_tool_id(&reference, "").is_err());
+        assert!(encode_tool_id(&reference, &"x".repeat(MAX_TOOL_ID_BYTES + 1)).is_err());
+        let prefix = format!("{TOOL_PREFIX}{}_", Store::id(&reference).unwrap());
+        for id in [
+            TOOL_PREFIX.to_owned(),
+            format!("{TOOL_PREFIX}invalid_YQ"),
+            prefix.clone(),
+            format!("{prefix}YQ=="),
+            format!("{prefix}YR"),
+            format!("{prefix}_w"),
+            format!("{prefix}{}", "A".repeat(2000)),
+        ] {
+            assert!(decode_tool_id(&id).is_err(), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_normalization_rejects_conflicts_edits_and_partial_records() {
+        let directory = std::env::temp_dir().join(format!(
+            "tinyllm-carrier-validation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(directory.clone(), 100_000, 50_000)
+            .await
+            .unwrap();
+        let mut contents = Vec::new();
+        for _ in 0..2 {
+            let reference = Store::reference();
+            let content = json!([
+                {"type":"redacted_thinking","data":reference},
+                {"type":"text","text":"checking"},
+                {"type":"tool_use","id":"call_a","name":"lookup","input":{}},
+                {"type":"tool_use","id":"call_b","name":"lookup","input":{}}
+            ]);
+            store
+                .save_scoped(
+                    &reference,
+                    "openai",
+                    "old",
+                    &json!({"output":[]}),
+                    content.clone(),
+                    &BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+            let mut wire = content.as_array().unwrap().clone();
+            for block in &mut wire {
+                mark_block(block, &reference).unwrap();
+            }
+            contents.push(wire);
+        }
+        let restored =
+            |content: Vec<Value>| json!({"messages":[{"role":"assistant","content":content}]});
+        assert!(
+            store
+                .restore_scoped(&restored(contents[0].clone()), "openai", "new")
+                .await
+                .is_ok()
+        );
+        let mut stripped = contents[0][1..].to_vec();
+        assert!(
+            store
+                .restore_scoped(&restored(stripped.clone()), "openai", "new")
+                .await
+                .is_ok()
+        );
+        let mut invalid = Vec::new();
+        let mut conflict = contents[0].clone();
+        conflict[1][REFERENCE_FIELD] = contents[1][0]["data"].clone();
+        invalid.push(conflict);
+        let mut conflict = stripped.clone();
+        conflict[1]["id"] = contents[1][2]["id"].clone();
+        invalid.push(conflict);
+        let mut reordered = stripped.clone();
+        reordered.swap(1, 2);
+        invalid.push(reordered);
+        invalid.push(stripped[..2].to_vec());
+        let mut duplicate = stripped.clone();
+        duplicate.extend(stripped.clone());
+        invalid.push(duplicate);
+        let mut extra = stripped.clone();
+        extra.push(json!({"type":"text","text":"unreferenced extra"}));
+        invalid.push(extra);
+        let mut malformed = stripped.clone();
+        malformed[0][REFERENCE_FIELD] = json!(42);
+        invalid.push(malformed);
+        let mut malformed = stripped.clone();
+        malformed[1][REFERENCE_FIELD] = contents[0][0]["data"].clone();
+        invalid.push(malformed);
+        stripped[1]["input"] = json!({"unexpected":true});
+        invalid.push(stripped);
+        for content in invalid {
+            assert!(
+                store
+                    .restore_scoped(&restored(content.clone()), "openai", "new")
+                    .await
+                    .is_err(),
+                "{content:?}"
+            );
+        }
+        let combined: Vec<_> = contents
+            .iter()
+            .flat_map(|content| content[1..].to_vec())
+            .collect();
+        assert!(
+            store
+                .restore_scoped(&restored(combined), "openai", "new")
+                .await
+                .is_ok()
+        );
+        let missing = json!({"messages":[{"role":"assistant","content":[{"type":"text","text":"missing","tinyllm_continuation":Store::reference()}]}]});
+        assert!(
+            store
+                .restore_scoped(&missing, "openai", "new")
+                .await
+                .unwrap_err()
+                .message
+                .contains("state is missing")
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_scope_is_explicit_and_ambiguous_legacy_names_fail_closed() {
+        let directory =
+            std::env::temp_dir().join(format!("tinyllm-provider-scope-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(directory.clone(), 100_000, 50_000)
+            .await
+            .unwrap();
+        let native = json!({"output":[]});
+        for legacy in ["old", "openai/old", "other/old", "org/path/model"] {
+            let reference = Store::reference();
+            let content = json!([{"type":"redacted_thinking","data":reference}]);
+            store
+                .save(&reference, legacy, &native, content.clone())
+                .await
+                .unwrap();
+            let req = json!({"messages":[{"role":"assistant","content":content}]});
+            assert_eq!(
+                store.restore_scoped(&req, "openai", "new").await.is_ok(),
+                matches!(legacy, "old" | "openai/old")
+            );
+            assert!(store.restore_scoped(&req, "other", "old").await.is_err());
+        }
+        let reference = Store::reference();
+        let content = json!([{"type":"redacted_thinking","data":reference}]);
+        store
+            .save_scoped(
+                &reference,
+                "other",
+                "org/path/model",
+                &native,
+                content.clone(),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        let req = json!({"messages":[{"role":"assistant","content":content}]});
+        assert!(store.restore_scoped(&req, "other", "new").await.is_ok());
+        assert!(
+            store
+                .restore_scoped(&req, "openai", "other/org/path/model")
+                .await
+                .is_err()
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn migration_survives_lowered_response_and_store_limits() {
@@ -1091,7 +1411,8 @@ mod tests {
         let second = Store::reference();
         let request = json!({"messages":[{"role":"assistant","content":[
             {"type":"redacted_thinking","data":first},
-            {"type":"redacted_thinking","data":second}
+            {"type":"text","text":"first","tinyllm_continuation":first},
+            {"type":"tool_use","id":encode_tool_id(&second, "call_second").unwrap(),"name":"lookup","input":{}}
         ]}]});
         let mut pins = Vec::new();
         let mut restore = Box::pin(store.restore_scoped_pinned(&request, "openai", "m", &mut pins));

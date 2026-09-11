@@ -3,6 +3,7 @@ use crate::{
     config::Server,
     error::Error,
     models::{ApiEvent, ApiFormat, ApiRequest, ProviderOutput, RequestContext, ResponseBody},
+    providers::openai::state::{PREFIX, REFERENCE_FIELD, TOOL_PREFIX},
 };
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
@@ -200,15 +201,28 @@ pub(crate) async fn forward(
     })
 }
 
-fn contains_reference(value: &Value) -> bool {
+pub(crate) fn contains_reference(value: &Value) -> bool {
     match value {
         Value::Array(values) => values.iter().any(contains_reference),
         Value::Object(values) => {
             (value["type"] == "redacted_thinking"
                 && value["data"]
                     .as_str()
-                    .is_some_and(|s| s.starts_with("tinyllm:v1:")))
+                    .is_some_and(|s| s.starts_with(PREFIX)))
                 || value["type"] == "tinyllm_continuation"
+                || (value["type"] == "text" && values.contains_key(REFERENCE_FIELD))
+                || values
+                    .get(REFERENCE_FIELD)
+                    .and_then(Value::as_str)
+                    .is_some_and(|reference| reference.starts_with(PREFIX))
+                || ["id", "tool_use_id", "tool_call_id", "call_id"]
+                    .iter()
+                    .any(|key| {
+                        values
+                            .get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| id.starts_with(TOOL_PREFIX))
+                    })
                 || values.values().any(contains_reference)
         }
         _ => false,

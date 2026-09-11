@@ -17,6 +17,7 @@ use crate::{
     error::Error,
     models::{
         ApiEvent, ApiFormat, ApiRequest, ModelInfo, ProviderOutput, RequestContext, ResponseBody,
+        anthropic::StreamEvent,
     },
     providers::{Provider, http, validate_effort},
 };
@@ -199,8 +200,8 @@ impl OpenAiProvider {
             );
         }
         headers.insert("x-tinyllm-compatibility",HeaderValue::from_static(if subscription {
-            "anthropic-cache-hints-ignored; openai-automatic-caching; reasoning-reference-v1; subscription-max-tokens-unenforced"
-        } else { "anthropic-cache-hints-ignored; openai-automatic-caching; reasoning-reference-v1" }));
+            "anthropic-cache-hints-ignored; openai-automatic-caching; reasoning-reference-v1; model-switch-carriers-v1; subscription-max-tokens-unenforced"
+        } else { "anthropic-cache-hints-ignored; openai-automatic-caching; reasoning-reference-v1; model-switch-carriers-v1" }));
         if upstream_request["stream"] == true
             && !upstream
                 .headers()
@@ -227,17 +228,17 @@ impl OpenAiProvider {
                         reject_citation_controls(native)?;
                     }
                     for event in events.into_iter().flat_map(|event| stops.push(event)) {
-                        yield ApiEvent::Anthropic(serde_json::to_value(event).map_err(|_| Error::upstream("cannot encode stream event"))?);
+                        yield anthropic_event(event, &reference)?;
                     }
                     if let Some(mut native) = translator.completed.take() {
                         let mut response = protocol::response(&native,&alias,&reference).map_err(|mut e| {e.message=e.message.replace(&key,"[redacted]");e})?;
                         for event in stops.finish() {
-                            yield ApiEvent::Anthropic(serde_json::to_value(event).map_err(|_| Error::upstream("cannot encode stream event"))?);
+                            yield anthropic_event(event, &reference)?;
                         }
                         stops.apply(&mut native, &mut response)?;
                         store.save_scoped(&reference,&context.provider,&model.id,&native,serde_json::to_value(&response.content).map_err(|_| Error::upstream("cannot encode response content"))?,&defaults).await?;
                         tracing::info!(output_tokens=response.usage.output_tokens,"stream completed");
-                        for event in stream::finish(&response) { yield ApiEvent::Anthropic(serde_json::to_value(event).map_err(|_| Error::upstream("cannot encode stream event"))?); }
+                        for event in stream::finish(&response) { yield anthropic_event(event, &reference)?; }
                         break;
                     }
                 }
@@ -286,10 +287,12 @@ impl OpenAiProvider {
                     &defaults,
                 )
                 .await?;
-            ResponseBody::Json(
-                serde_json::to_value(response)
-                    .map_err(|_| Error::upstream("cannot encode response"))?,
-            )
+            let mut response = serde_json::to_value(response)
+                .map_err(|_| Error::upstream("cannot encode response"))?;
+            for block in response["content"].as_array_mut().unwrap() {
+                state::mark_block(block, &reference)?;
+            }
+            ResponseBody::Json(response)
         };
         Ok(ProviderOutput {
             headers,
@@ -297,6 +300,15 @@ impl OpenAiProvider {
             state_pins,
         })
     }
+}
+
+fn anthropic_event(event: StreamEvent, reference: &str) -> Result<ApiEvent> {
+    let mut event =
+        serde_json::to_value(event).map_err(|_| Error::upstream("cannot encode stream event"))?;
+    if let Some(block) = event.get_mut("content_block") {
+        state::mark_block(block, reference)?;
+    }
+    Ok(ApiEvent::Anthropic(event))
 }
 
 fn reject_citation_controls(native: &Value) -> Result<()> {

@@ -37,6 +37,29 @@ fn native_options_and_reasoning_are_preserved() {
 }
 
 #[test]
+fn native_responses_reject_all_gateway_reference_carriers() {
+    for subscription in [false, true] {
+        for item in [
+            json!({"role":"assistant","content":[{"type":"redacted_thinking","data":"tinyllm:v1:foreign"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"visible","tinyllm_continuation":"tinyllm:v1:foreign"}]}),
+            json!({"type":"function_call","call_id":"toolu_tinyllm_malformed","name":"lookup","arguments":"{}"}),
+            json!({"type":"function_call_output","call_id":"toolu_tinyllm_malformed","output":"ok"}),
+            json!({"type":"tinyllm_continuation","data":"tinyllm:v1:foreign"}),
+        ] {
+            assert!(request::native(json!({"input":[item]}), &model(), subscription).is_err());
+        }
+        assert!(
+            request::native(
+                json!({"input":"Discuss tinyllm_continuation and toolu_tinyllm_ as text", "text":{"format":{"type":"json_schema","name":"reply","schema":{"type":"object","properties":{"tinyllm_continuation":{"type":"string"}}}}}}),
+                &model(),
+                subscription
+            )
+            .is_ok()
+        );
+    }
+}
+
+#[test]
 fn chat_converts_roles_images_tools_and_rejects_unsupported_controls() {
     let original = json!({"model":"openai/gpt-native","messages":[{"role":"system","content":"system"},{"role":"developer","content":"developer"},{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"https://example.com/image.png","detail":"low"}}]}],"tools":[{"type":"function","function":{"name":"lookup","description":"lookup a value","parameters":{"type":"object"},"strict":false}}],"tool_choice":{"type":"function","function":{"name":"lookup"}},"response_format":{"type":"json_schema","json_schema":{"name":"reply","schema":{"type":"object"},"strict":true}},"reasoning_effort":"low","max_completion_tokens":20});
     let converted = request::chat(&original, &model(), false, &Default::default()).unwrap();
@@ -305,7 +328,7 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
                         let message = response["choices"][0]["message"].clone();
                         let history = request::history(&json!({"messages":[message]})).unwrap();
                         let restored = store
-                            .restore_scoped(&history, "codex", "gpt-native")
+                            .restore_scoped(&history, "codex", "gpt-other")
                             .await
                             .unwrap();
                         assert_eq!(restored[&0][0], reasoning);
@@ -328,8 +351,19 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
                             ApiEvent::ChatCompletions(value)
                                 if !value["choices"][0]["finish_reason"].is_null() =>
                             {
+                                let details = &value["choices"][0]["delta"]["reasoning_details"];
+                                assert!(details.is_array());
+                                let history = request::history(&json!({"messages":[{"role":"assistant","reasoning_details":details}]})).unwrap();
+                                let restored = store
+                                    .restore_scoped(&history, "codex", "gpt-other")
+                                    .await
+                                    .unwrap();
+                                assert_eq!(restored[&0][0], reasoning);
                                 assert!(
-                                    value["choices"][0]["delta"]["reasoning_details"].is_array()
+                                    store
+                                        .restore_scoped(&history, "openai", "gpt-other")
+                                        .await
+                                        .is_err()
                                 );
                                 terminal = true;
                             }

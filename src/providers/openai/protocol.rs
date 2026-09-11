@@ -2,7 +2,7 @@ use crate::{
     Result,
     error::Error,
     models::anthropic::{AnthropicResponse, ResponseContent, Usage},
-    providers::openai::models::Model,
+    providers::openai::{models::Model, state},
 };
 use base64::Engine;
 use serde_json::{Value, json};
@@ -114,6 +114,7 @@ pub fn request(
         .filter(|m| !m.is_empty())
         .ok_or_else(|| Error::invalid("messages must be a nonempty array"))?;
     let mut pending = HashSet::new();
+    let mut pending_client_calls = HashSet::new();
     let mut calls = HashSet::new();
     let mut loaded = HashSet::new();
     for (index, message) in messages.iter().enumerate() {
@@ -121,6 +122,19 @@ pub fn request(
         let role = string(message, "role")?;
         if !matches!(role, "user" | "assistant" | "system") {
             return Err(Error::invalid("unsupported message role"));
+        }
+        if role == "assistant" {
+            for block in message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|block| block["type"] == "tool_use")
+            {
+                let id = string(block, "id")?;
+                if id.is_empty() || !pending_client_calls.insert(id) {
+                    return Err(Error::invalid("empty or duplicate tool call ID"));
+                }
+            }
         }
         let mut items = Vec::new();
         if let Some(native) = restored.get(&index) {
@@ -139,6 +153,8 @@ pub fn request(
                         flush(&mut items, &mut parts, role);
                         fields(&block, &["type", "id", "name", "input", "cache_control"])?;
                         let id = string(&block, "id")?;
+                        let decoded = state::decode_tool_id(id)?;
+                        let id = decoded.as_ref().map_or(id, |(_, id)| id.as_str());
                         let name = string(&block, "name")?;
                         valid_name(name)?;
                         if !block["input"].is_object() {
@@ -158,6 +174,14 @@ pub fn request(
                                 "cache_control",
                             ],
                         )?;
+                        let id = string(&block, "tool_use_id")?;
+                        if !pending_client_calls.remove(id) {
+                            return Err(Error::invalid(
+                                "tool result has no matching unresolved client tool call",
+                            ));
+                        }
+                        let decoded = state::decode_tool_id(id)?;
+                        let id = decoded.as_ref().map_or(id, |(_, id)| id.as_str());
                         let is_error = match block.get("is_error") {
                             None => false,
                             Some(v) => v
@@ -196,7 +220,9 @@ pub fn request(
                                     json!(json!({"is_error":true,"content":output}).to_string());
                             }
                         }
-                        items.push(json!({"type":"function_call_output","call_id":string(&block,"tool_use_id")?,"output":output}));
+                        items.push(
+                            json!({"type":"function_call_output","call_id":id,"output":output}),
+                        );
                     }
                     "thinking" | "redacted_thinking" => {
                         return Err(Error::invalid(
@@ -231,7 +257,7 @@ pub fn request(
         }
         input.extend(items);
     }
-    if !pending.is_empty() {
+    if !pending.is_empty() || !pending_client_calls.is_empty() {
         return Err(Error::invalid("history has tool calls without results"));
     }
     out["input"] = json!(input);

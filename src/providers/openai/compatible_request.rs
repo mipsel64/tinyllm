@@ -4,6 +4,11 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 
 pub fn native(mut body: Value, model: &Model, subscription: bool) -> Result<Value> {
+    if crate::providers::http::contains_reference(&body) {
+        return Err(Error::invalid(
+            "tinyllm continuation references cannot be forwarded as native Responses input",
+        ));
+    }
     let object = body
         .as_object_mut()
         .ok_or_else(|| Error::invalid("request must be an object"))?;

@@ -633,14 +633,35 @@ async fn native_rejects_foreign_reasoning_before_network() {
         server,
     )
     .unwrap();
-    let request = ApiRequest::parse(ApiFormat::Anthropic, json!({"model":"router/glm","messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"tinyllm:v1:foreign-reference"}]}]})).unwrap();
-    let result = provider.execute(request, context("glm")).await;
-    assert_eq!(result.err().unwrap().status, StatusCode::BAD_REQUEST);
-    for body in [
-        json!({"model":"router/glm","background":true,"input":"hello"}),
-        json!({"model":"router/glm","messages":[{"role":"assistant","reasoning_details":[{"type":"tinyllm_continuation","data":"tinyllm:v1:foreign-reference"}]}]}),
+    for block in [
+        json!({"type":"redacted_thinking","data":"tinyllm:v1:foreign-reference"}),
+        json!({"type":"text","text":"visible","tinyllm_continuation":"tinyllm:v1:foreign-reference"}),
+        json!({"type":"tool_use","id":"toolu_tinyllm_malformed","name":"lookup","input":{}}),
+        json!({"type":"tool_result","tool_use_id":"toolu_tinyllm_malformed","content":"ok"}),
     ] {
-        let request = ApiRequest::parse(ApiFormat::Responses, body).unwrap();
+        let request = ApiRequest::parse(
+            ApiFormat::Anthropic,
+            json!({"model":"router/glm","messages":[{"role":"assistant","content":[block]}]}),
+        )
+        .unwrap();
+        let result = provider.execute(request, context("glm")).await;
+        assert_eq!(result.err().unwrap().status, StatusCode::BAD_REQUEST);
+    }
+    for (format, body) in [
+        (
+            ApiFormat::Responses,
+            json!({"model":"router/glm","background":true,"input":"hello"}),
+        ),
+        (
+            ApiFormat::Responses,
+            json!({"model":"router/glm","messages":[{"role":"assistant","reasoning_details":[{"type":"tinyllm_continuation","data":"tinyllm:v1:foreign-reference"}]}]}),
+        ),
+        (
+            ApiFormat::ChatCompletions,
+            json!({"model":"router/glm","messages":[{"role":"tool","tool_call_id":"toolu_tinyllm_malformed","content":"ok"}]}),
+        ),
+    ] {
+        let request = ApiRequest::parse(format, body).unwrap();
         let result = provider.execute(request, context("glm")).await;
         assert_eq!(result.err().unwrap().status, StatusCode::BAD_REQUEST);
     }

@@ -487,7 +487,7 @@ async fn web_search_max_uses_eight_round_trip_restores_native_output_after_resta
     assert_eq!(response["content"].as_array().unwrap().len(), 3);
     assert_eq!(
         response["content"][1],
-        json!({"type":"text","text":"héllo"})
+        json!({"type":"text","text":"héllo","tinyllm_continuation":response["content"][0]["data"]})
     );
     assert_eq!(
         response["content"][2]["text"],
@@ -804,6 +804,212 @@ async fn classifier_stop_sequence_returns_only_visible_output() {
     tokio::fs::remove_dir_all(directory).await.unwrap();
 }
 
+fn continuation_wire_content(content: &Value) -> Value {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let reference = content[0]["data"].as_str().unwrap();
+    let id = reference.strip_prefix(state::PREFIX).unwrap();
+    let mut wire = content.clone();
+    for block in wire.as_array_mut().unwrap() {
+        match block["type"].as_str() {
+            Some("text") => block["tinyllm_continuation"] = json!(reference),
+            Some("tool_use") => {
+                block["id"] = json!(format!(
+                    "toolu_tinyllm_{id}_{}",
+                    URL_SAFE_NO_PAD.encode(block["id"].as_str().unwrap())
+                ));
+            }
+            _ => {}
+        }
+    }
+    wire
+}
+
+#[tokio::test]
+async fn model_switch_preserves_scoped_and_legacy_continuations() {
+    let directory =
+        std::env::temp_dir().join(format!("tinyllm-model-switch-{}", uuid::Uuid::new_v4()));
+    let store = state::Store::open(directory.clone(), 100_000, 50_000)
+        .await
+        .unwrap();
+    let native = upstream_response(json!([
+        {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"},
+        {"type":"message","id":"msg_1","role":"assistant","phase":"final_answer","status":"completed","content":[{"type":"output_text","text":"Ready","annotations":[]}]}
+    ]));
+    for legacy in [false, true] {
+        let reference = state::Store::reference();
+        let content = serde_json::to_value(
+            protocol::response(&native, "openai/gpt-5.6-sol", &reference)
+                .unwrap()
+                .content,
+        )
+        .unwrap();
+        if legacy {
+            store
+                .save(&reference, "gpt-5.6-sol", &native, content.clone())
+                .await
+                .unwrap();
+        } else {
+            store
+                .save_scoped(
+                    &reference,
+                    "openai",
+                    "gpt-5.6-sol",
+                    &native,
+                    content.clone(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let req = json!({"messages":[{"role":"assistant","content":content}]});
+        let restored = store
+            .restore_scoped(&req, "openai", "gpt-5.6-terra")
+            .await
+            .unwrap();
+        assert_eq!(json!(restored[&0]), native["output"]);
+        assert!(
+            store
+                .restore_scoped(&req, "other", "gpt-5.6-terra")
+                .await
+                .is_err()
+        );
+    }
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn model_switch_carriers_restore_text_and_tool_only_history() {
+    let directory = std::env::temp_dir().join(format!("tinyllm-carriers-{}", uuid::Uuid::new_v4()));
+    let store = state::Store::open(directory.clone(), 100_000, 50_000)
+        .await
+        .unwrap();
+    let text = json!({"type":"message","id":"msg_1","role":"assistant","phase":"commentary","status":"completed","content":[{"type":"output_text","text":"Checking","annotations":[]}]});
+    let call = json!({"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{}","status":"completed"});
+    let other = json!({"type":"function_call","id":"fc_2","call_id":"call_2","name":"lookup","arguments":"{}","status":"completed"});
+    let mut nested = call.clone();
+    nested["call_id"] = json!("toolu_tinyllm_11111111111111111111111111111111_Y2FsbF9pbm5lcg");
+    let mut long = call.clone();
+    long["call_id"] = json!("n".repeat(1024));
+    for output in [
+        vec![text.clone()],
+        vec![call.clone()],
+        vec![text, call, other],
+        vec![nested],
+        vec![long],
+    ] {
+        let mut items =
+            vec![json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"})];
+        items.extend(output);
+        let native = upstream_response(json!(items));
+        let reference = state::Store::reference();
+        let content = serde_json::to_value(
+            protocol::response(&native, "openai/gpt-5.6-sol", &reference)
+                .unwrap()
+                .content,
+        )
+        .unwrap();
+        store
+            .save_scoped(
+                &reference,
+                "openai",
+                "gpt-5.6-sol",
+                &native,
+                content.clone(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        for keep_thinking in [false, true] {
+            let mut wire = continuation_wire_content(&content);
+            wire.as_array_mut()
+                .unwrap()
+                .retain(|block| keep_thinking || block["type"] != "redacted_thinking");
+            let mut req = request();
+            req["model"] = json!("openai/gpt-5.6-terra");
+            let messages = req["messages"].as_array_mut().unwrap();
+            for block in wire.as_array().unwrap() {
+                messages.push(json!({"role":"assistant","content":[block]}));
+            }
+            let results: Vec<_> = wire
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .map(|block| json!({"type":"tool_result","tool_use_id":block["id"],"content":"ok"}))
+                .collect();
+            messages.push(json!({"role":"user","content":if results.is_empty() {json!("Continue")} else {json!(results)}}));
+            let restored = store
+                .restore_scoped(&req, "openai", "gpt-5.6-terra")
+                .await
+                .unwrap();
+            assert_eq!(json!(restored[&1]), native["output"]);
+            let translated = protocol::request(
+                &req,
+                &Model {
+                    id: "gpt-5.6-terra".into(),
+                    reasoning_effort: None,
+                },
+                &restored,
+            )
+            .unwrap();
+            assert_eq!(translated["model"], "gpt-5.6-terra");
+            let input = translated["input"].as_array().unwrap();
+            assert_eq!(&input[2..2 + items.len()], items);
+            for item in input
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+            {
+                assert!(items.iter().any(|native| native["type"] == "function_call"
+                    && native["call_id"] == item["call_id"]));
+            }
+            if !results.is_empty() {
+                let last = req["messages"].as_array().unwrap().len() - 1;
+                for id in [
+                    items
+                        .iter()
+                        .find(|item| item["type"] == "function_call")
+                        .unwrap()["call_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    results[0]["tool_use_id"].as_str().unwrap().replacen(
+                        reference.strip_prefix(state::PREFIX).unwrap(),
+                        &uuid::Uuid::new_v4().simple().to_string(),
+                        1,
+                    ),
+                ] {
+                    let mut changed = req.clone();
+                    changed["messages"][last]["content"][0]["tool_use_id"] = json!(id);
+                    assert!(protocol::request(&changed, &model(), &restored).is_err());
+                }
+                let mut duplicate = req.clone();
+                duplicate["messages"][last]["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(results[0].clone());
+                assert!(protocol::request(&duplicate, &model(), &restored).is_err());
+                let mut premature = req.clone();
+                let messages = premature["messages"].as_array_mut().unwrap();
+                let result = messages.remove(last);
+                messages.insert(1, result);
+                let restored = store
+                    .restore_scoped(&premature, "openai", "gpt-5.6-terra")
+                    .await
+                    .unwrap();
+                assert!(
+                    protocol::request(&premature, &model(), &restored)
+                        .unwrap_err()
+                        .message
+                        .contains("unresolved client tool call")
+                );
+            }
+        }
+    }
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[tokio::test]
 async fn continuation_survives_restart_forks_and_explicit_compaction_boundary() {
     use state::Store;
@@ -950,6 +1156,74 @@ async fn claude_fork_bootstrap_preserves_inherited_and_worker_reasoning() {
     }
     drop(store);
     tokio::fs::remove_dir_all(directory).await.unwrap();
+}
+
+#[tokio::test]
+async fn claude_fork_carriers_do_not_restore_the_spawning_response() {
+    let directory =
+        std::env::temp_dir().join(format!("tinyllm-fork-carriers-{}", uuid::Uuid::new_v4()));
+    let store = state::Store::open_with_cleanup(
+        directory.clone(),
+        100_000,
+        50_000,
+        Some(Default::default()),
+    )
+    .await
+    .unwrap();
+    let reference = state::Store::reference();
+    let native = upstream_response(json!([
+        {"type":"reasoning","id":"rs_spawn","summary":[],"encrypted_content":"spawning-reasoning"},
+        {"type":"function_call","id":"fc_spawn_1","call_id":"fork_1","name":"Agent","arguments":"{\"subagent_type\":\"fork\"}"},
+        {"type":"function_call","id":"fc_spawn_2","call_id":"fork_2","name":"Agent","arguments":"{\"subagent_type\":\"fork\"}"}
+    ]));
+    let content = serde_json::to_value(
+        protocol::response(&native, "openai/old", &reference)
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    let wire = continuation_wire_content(&content);
+    for committed in [false, true] {
+        if committed {
+            store
+                .save_scoped(
+                    &reference,
+                    "openai",
+                    "old",
+                    &native,
+                    content.clone(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let mut req = claude_fork_request();
+        req["messages"][1]["content"] = json!([wire[1]]);
+        req["messages"][2]["content"][0]["tool_use_id"] = wire[1]["id"].clone();
+        let restored = store.restore_scoped(&req, "openai", "new").await.unwrap();
+        assert!(restored.is_empty());
+        let output = protocol::request(&req, &model(), &restored).unwrap();
+        assert_eq!(output["input"][2]["call_id"], "fork_1");
+        assert_eq!(output["input"][3]["call_id"], "fork_1");
+        assert!(!output.to_string().contains("spawning-reasoning"));
+        assert!(!output.to_string().contains("fork_2"));
+        for (pointer, value) in [
+            ("/messages/1/content/0/name", json!("lookup")),
+            ("/messages/2/content/0/tool_use_id", json!("fork_1")),
+            ("/messages/2/content/1/text", json!("not a worker boundary")),
+        ] {
+            let mut invalid = req.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                store
+                    .restore_scoped(&invalid, "openai", "new")
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]
@@ -2222,10 +2496,16 @@ async fn subscription_json_stream_tools_reasoning_and_concurrency() {
     assert!(sse.contains("input_json_delta") && sse.contains("message_stop"));
     assert!(!sse.contains("event: error"));
     assert!(maximum.load(Ordering::SeqCst) >= 2);
+    let calls: Vec<_> = response["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|block| block["type"] == "tool_use")
+        .collect();
     let mut followup = request();
     followup["messages"].as_array_mut().unwrap().extend([
         json!({"role":"assistant","content":response["content"]}),
-        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"call_a","content":"ok"},{"type":"tool_result","tool_use_id":"call_b","is_error":true,"content":"denied"}]}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":calls[0]["id"],"content":"ok"},{"type":"tool_result","tool_use_id":calls[1]["id"],"is_error":true,"content":"denied"}]}),
         json!({"role":"system","content":"background notification"}),
     ]);
     assert_eq!(
