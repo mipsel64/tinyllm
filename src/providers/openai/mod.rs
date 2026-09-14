@@ -47,10 +47,7 @@ impl OpenAiProvider {
         let base = native
             .strip_suffix("-fast")
             .filter(|b| !b.ends_with("-fast"))?;
-        (!self.config.models.contains_key(native)
-            && base.starts_with("gpt-")
-            && self.config.models.contains_key(base))
-        .then_some(base)
+        (!self.config.models.contains_key(native) && base.starts_with("gpt-")).then_some(base)
     }
 
     fn model(&self, native: &str) -> Model {
