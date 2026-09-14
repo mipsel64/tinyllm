@@ -141,6 +141,16 @@ fn web_search_request_maps_parameters_and_subscription_best_effort_cap() {
         );
     }
     req.as_object_mut().unwrap().remove("tool_choice");
+    for cap in [json!(null), json!(-1), json!(1.5), json!("8"), json!(true)] {
+        req["tools"] = json!([{"type":"web_search_20250305","name":"web_search","max_uses":cap}]);
+        let out = protocol::request(&req, &model()).unwrap();
+        assert!(out.get("max_tool_calls").is_none(), "{cap}");
+        assert_eq!(
+            protocol::subscription_request(&req, out).unwrap()["instructions"],
+            "Keep ALL instructions.",
+            "{cap}"
+        );
+    }
     req["tools"] = json!([{"type":"web_search_20250305","name":"web_search"}]);
     let out = protocol::request(&req, &model()).unwrap();
     assert_eq!(out["tools"], json!([{"type":"web_search"}]));
@@ -187,11 +197,6 @@ fn web_search_request_rejects_invalid_or_unsupported_options() {
         json!({"type":"web_fetch_20250910"}),
         json!({"type":42}),
         json!({"name":"search"}),
-        json!({"max_uses":0}),
-        json!({"max_uses":-1}),
-        json!({"max_uses":1.5}),
-        json!({"max_uses":"8"}),
-        json!({"max_uses":true}),
         json!({"allowed_domains":false}),
         json!({"allowed_domains":[42]}),
         json!({"allowed_domains":["https://example.org"]}),

@@ -291,11 +291,6 @@ pub fn request(req: &Value, model: &Model) -> Result<Value> {
                     ));
                 }
                 translated.push(web_search_tool(tool)?);
-                if let Some(limit) = tool.get("max_uses").filter(|v| !v.is_null())
-                    && limit.as_u64().is_none_or(|n| n == 0)
-                {
-                    return Err(Error::invalid("web search max_uses must be positive"));
-                }
                 available.insert(name);
                 search = true;
                 continue;
