@@ -110,9 +110,10 @@ more credits or cost more.
 
 In auto permission mode Claude Code checks every tool call with a short
 subrequest, which by default runs on the session's model — so a reasoning model
-is asked to judge each Bash command before it runs. Set
-`server.auto_review_model` to a small fast model to make those checks quicker
-and cheaper.
+is asked to judge each Bash command before it runs. `server.auto_review_model`
+routes those checks to a small fast model instead, which is quicker and cheaper
+but hands every permission decision to that model: a weaker reviewer denies more,
+including benign commands. Leave it unset unless the latency is worth that.
 
 Claude Code asks for `high` reasoning effort on every turn, so a configured
 `reasoning_effort` cannot bring it down. `max_reasoning_effort` is a ceiling

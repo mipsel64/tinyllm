@@ -291,16 +291,6 @@ pub fn request(req: &Value, model: &Model) -> Result<Value> {
                     ));
                 }
                 translated.push(web_search_tool(tool)?);
-                if let Some(limit) = tool.get("max_uses").filter(|v| !v.is_null()) {
-                    out["max_tool_calls"] = json!(
-                        limit
-                            .as_u64()
-                            .filter(|n| *n > 0)
-                            .ok_or_else(|| Error::invalid(
-                                "web search max_uses must be positive"
-                            ))?
-                    );
-                }
                 available.insert(name);
                 search = true;
                 continue;
@@ -471,6 +461,16 @@ pub fn request(req: &Value, model: &Model) -> Result<Value> {
     Ok(out)
 }
 
+/// Anthropic's per-request search cap. OpenAI has no equivalent, so it is advisory only.
+pub fn search_limit(req: &Value) -> Option<u64> {
+    req.get("tools")?
+        .as_array()?
+        .iter()
+        .find(|tool| tool["type"] == "web_search_20250305")?
+        .get("max_uses")?
+        .as_u64()
+}
+
 fn web_search_tool(tool: &Value) -> Result<Value> {
     fields(
         tool,
@@ -599,11 +599,11 @@ pub fn subscription_request(req: &Value, mut out: Value) -> Result<Value> {
             item["role"] = json!("developer");
         }
     }
-    if let Some(limit) = out.as_object_mut().unwrap().remove("max_tool_calls") {
+    if let Some(limit) = search_limit(req) {
         instructions.push(format!(
             "Search budget: use the web_search tool at most {limit} times for this response."
         ));
-        tracing::warn!(max_uses = %limit, "subscription web search limit is best-effort; the backend does not support a hard cap");
+        tracing::warn!(max_uses = %limit, "web search limit is best-effort; no OpenAI parameter enforces a hard cap");
     }
     out["instructions"] = json!(instructions.join("\n\n"));
     out["stream"] = json!(true);

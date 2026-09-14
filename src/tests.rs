@@ -112,7 +112,7 @@ fn web_search_request_maps_parameters_and_subscription_best_effort_cap() {
             "user_location":req["tools"][1]["user_location"]
         })
     );
-    assert_eq!(out["max_tool_calls"], 8);
+    assert!(out.get("max_tool_calls").is_none());
     assert_eq!(out["tool_choice"], json!({"type":"web_search"}));
     assert_eq!(out["parallel_tool_calls"], false);
     let subscription = protocol::subscription_request(&req, out.clone()).unwrap();
@@ -141,6 +141,16 @@ fn web_search_request_maps_parameters_and_subscription_best_effort_cap() {
         );
     }
     req.as_object_mut().unwrap().remove("tool_choice");
+    for cap in [json!(null), json!(-1), json!(1.5), json!("8"), json!(true)] {
+        req["tools"] = json!([{"type":"web_search_20250305","name":"web_search","max_uses":cap}]);
+        let out = protocol::request(&req, &model()).unwrap();
+        assert!(out.get("max_tool_calls").is_none(), "{cap}");
+        assert_eq!(
+            protocol::subscription_request(&req, out).unwrap()["instructions"],
+            "Keep ALL instructions.",
+            "{cap}"
+        );
+    }
     req["tools"] = json!([{"type":"web_search_20250305","name":"web_search"}]);
     let out = protocol::request(&req, &model()).unwrap();
     assert_eq!(out["tools"], json!([{"type":"web_search"}]));
@@ -187,11 +197,6 @@ fn web_search_request_rejects_invalid_or_unsupported_options() {
         json!({"type":"web_fetch_20250910"}),
         json!({"type":42}),
         json!({"name":"search"}),
-        json!({"max_uses":0}),
-        json!({"max_uses":-1}),
-        json!({"max_uses":1.5}),
-        json!({"max_uses":"8"}),
-        json!({"max_uses":true}),
         json!({"allowed_domains":false}),
         json!({"allowed_domains":[42]}),
         json!({"allowed_domains":["https://example.org"]}),
@@ -409,7 +414,7 @@ async fn web_search_max_uses_eight_round_trip_restores_native_output_after_resta
                     assert_eq!(req["model"], "gpt-test");
                     assert_eq!(req["tools"], json!([{"type":"web_search"}]));
                     assert_eq!(req["tool_choice"], "required");
-                    assert_eq!(req["max_tool_calls"], 8);
+                    assert!(req.get("max_tool_calls").is_none());
                     assert_eq!(req["max_output_tokens"], 1024);
                     assert_eq!(
                         req["input"][0]["content"][0]["text"],
@@ -443,7 +448,7 @@ async fn web_search_max_uses_eight_round_trip_restores_native_output_after_resta
     let status = response.status();
     assert_eq!(
         response.headers()["x-tinyllm-web-search"],
-        "native; citations=markdown; max-uses=upstream"
+        "native; citations=markdown; max-uses=ignored"
     );
     let response: Value = response.json().await.unwrap();
     assert_eq!(status, 200, "{response}");
