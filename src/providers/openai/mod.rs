@@ -175,7 +175,7 @@ impl OpenAiProvider {
         let search = upstream_request["tools"]
             .as_array()
             .is_some_and(|tools| tools.iter().any(|tool| tool["type"] == "web_search"));
-        let search_limit = upstream_request.get("max_tool_calls").is_some();
+        let search_limit = protocol::search_limit(&req).is_some();
         let constrained_output =
             stops.enabled() || upstream_request["text"]["format"]["type"] == "json_schema";
         if subscription {
@@ -197,7 +197,7 @@ impl OpenAiProvider {
                 "x-tinyllm-web-search",
                 HeaderValue::from_static(match (subscription, search_limit) {
                     (true, true) => "native; citations=markdown; max-uses=best-effort",
-                    (false, true) => "native; citations=markdown; max-uses=upstream",
+                    (false, true) => "native; citations=markdown; max-uses=ignored",
                     (_, false) => "native; citations=markdown; max-uses=unset",
                 }),
             );

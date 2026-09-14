@@ -112,7 +112,7 @@ fn web_search_request_maps_parameters_and_subscription_best_effort_cap() {
             "user_location":req["tools"][1]["user_location"]
         })
     );
-    assert_eq!(out["max_tool_calls"], 8);
+    assert!(out.get("max_tool_calls").is_none());
     assert_eq!(out["tool_choice"], json!({"type":"web_search"}));
     assert_eq!(out["parallel_tool_calls"], false);
     let subscription = protocol::subscription_request(&req, out.clone()).unwrap();
@@ -409,7 +409,7 @@ async fn web_search_max_uses_eight_round_trip_restores_native_output_after_resta
                     assert_eq!(req["model"], "gpt-test");
                     assert_eq!(req["tools"], json!([{"type":"web_search"}]));
                     assert_eq!(req["tool_choice"], "required");
-                    assert_eq!(req["max_tool_calls"], 8);
+                    assert!(req.get("max_tool_calls").is_none());
                     assert_eq!(req["max_output_tokens"], 1024);
                     assert_eq!(
                         req["input"][0]["content"][0]["text"],
@@ -443,7 +443,7 @@ async fn web_search_max_uses_eight_round_trip_restores_native_output_after_resta
     let status = response.status();
     assert_eq!(
         response.headers()["x-tinyllm-web-search"],
-        "native; citations=markdown; max-uses=upstream"
+        "native; citations=markdown; max-uses=ignored"
     );
     let response: Value = response.json().await.unwrap();
     assert_eq!(status, 200, "{response}");
