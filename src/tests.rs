@@ -2902,6 +2902,52 @@ fn auto_review_detection_needs_all_three_signals() {
 }
 
 #[test]
+fn drafted_feedback_is_read_from_the_turn_that_just_completed() {
+    use crate::models::request::RequestBody;
+    let body = |messages: Value| {
+        serde_json::from_value::<RequestBody>(
+            json!({"model":"openai/gpt-test","messages":messages}),
+        )
+        .unwrap()
+    };
+    let draft = json!({"type":"bug","title":"Misread the request","details":"What happened: ..."});
+    let call = json!({"type":"tool_use","id":"tu_1","name":"SendFeedback","input":draft});
+    let result = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1"}]});
+
+    // The request carrying the draft reports it, alongside other tool calls.
+    let turn = json!([
+        {"role":"user","content":"go"},
+        {"role":"assistant","content":[{"type":"tool_use","id":"tu_0","name":"Bash"}, call]},
+        result,
+    ]);
+    assert_eq!(body(turn).drafted_feedback(), Some(&draft));
+
+    // Once the conversation moves past it the same draft is not reported again,
+    // which is what keeps a stateless gateway from logging it every turn.
+    let later = json!([
+        {"role":"user","content":"go"},
+        {"role":"assistant","content":[call]},
+        result,
+        {"role":"assistant","content":[{"type":"text","text":"done"}]},
+        {"role":"user","content":"next"},
+    ]);
+    for messages in [
+        later,
+        json!([{"role":"assistant","content":[call]}]),
+        json!([{"role":"user","content":[call]}, result]),
+        json!([{"role":"assistant","content":[call]}, {"role":"assistant","content":"x"}]),
+        json!([{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]}, result]),
+        json!([{"role":"user","content":"go"}]),
+    ] {
+        assert_eq!(
+            body(messages.clone()).drafted_feedback(),
+            None,
+            "{messages}"
+        );
+    }
+}
+
+#[test]
 fn auto_review_model_must_name_a_configured_provider() {
     use crate::config::Config;
     let directory =

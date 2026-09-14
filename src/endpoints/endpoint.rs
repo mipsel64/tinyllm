@@ -112,6 +112,15 @@ async fn run(app: Arc<AppState>, request: Request, format: ApiFormat) -> crate::
         );
         request.body.model = reviewer.to_owned();
     }
+    // Left to run as the client intends: the draft is queued locally and does
+    // not interrupt the session. Only the operator never sees it.
+    if let Some(feedback) = request.body.drafted_feedback() {
+        tracing::warn!(
+            model = %request.body.model,
+            feedback = %feedback,
+            "model drafted client feedback about its own turn"
+        );
+    }
     let (provider, model) = app.providers.resolve(&request.body.model)?;
     let context = RequestContext {
         request_id,

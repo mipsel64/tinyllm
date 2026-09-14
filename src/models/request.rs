@@ -24,6 +24,11 @@ pub struct RequestBody {
 const AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
 
+/// Claude Code drafts a bug report with this tool when it judges that a turn
+/// went wrong. The draft is queued in the client and never reaches the operator
+/// running the gateway, though it is often a bug report about the gateway.
+const FEEDBACK_TOOL: &str = "SendFeedback";
+
 impl RequestBody {
     /// Recognises that permission-classifier subrequest: non-streaming, no
     /// tools, and the monitor system prompt. It wants a short verdict, so a
@@ -49,6 +54,25 @@ impl RequestBody {
             }),
             _ => false,
         }
+    }
+
+    /// Returns the feedback the model drafted on the turn that just completed.
+    /// Only the last exchange is read, so a draft is reported on the single
+    /// request that first carries it and not again as the history grows: the
+    /// gateway holds no state to deduplicate with.
+    pub fn drafted_feedback(&self) -> Option<&Value> {
+        let messages = self.fields.get("messages")?.as_array()?;
+        let [.., assistant, results] = messages.as_slice() else {
+            return None;
+        };
+        if assistant["role"] != "assistant" || results["role"] != "user" {
+            return None;
+        }
+        assistant["content"]
+            .as_array()?
+            .iter()
+            .find(|block| block["type"] == "tool_use" && block["name"] == FEEDBACK_TOOL)
+            .map(|block| &block["input"])
     }
 
     pub fn default_effort(&mut self, container: Option<&str>, effort: &str) {
