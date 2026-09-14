@@ -101,9 +101,10 @@ Use your `server.auth_token` if configured; otherwise `tinyllm` is a client
 placeholder. Choose models your account can access. The prefix is the provider
 table name; the rest is the upstream model ID, including any further slashes.
 Client reasoning effort and service tier override configured model defaults.
-For a configured OpenAI GPT model, append `-fast` (for example,
+For an OpenAI model ID beginning with `gpt-`, append `-fast` (for example,
 `openai/gpt-5.6-sol-fast`) to request the priority tier while sending the base model
-upstream, overriding client and configured service tiers; subscription requests also
+upstream, overriding client and configured service tiers; the base needs no model
+table, matching how unlisted IDs are forwarded; subscription requests also
 carry Codex's routing hint. The suffix does not stack, and upstream decides what it
 delivers: responses may still report `default`. Fast/priority processing can consume
 more credits or cost more.

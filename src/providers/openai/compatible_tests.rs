@@ -301,7 +301,7 @@ fn replayed(details: &Value) -> Value {
 }
 
 #[test]
-fn fast_suffix_resolves_only_configured_gpt_models() {
+fn fast_suffix_resolves_gpt_models() {
     use super::super::models::{Config, ModelOptions, OpenAiAuth};
     use crate::providers::Provider;
     let server = crate::config::Server::default();
@@ -319,15 +319,17 @@ fn fast_suffix_resolves_only_configured_gpt_models() {
         server,
     )
     .unwrap();
-    assert_eq!(
-        provider.synthetic_fast_base("gpt-6-astra-fast"),
-        Some("gpt-6-astra")
-    );
+    for (native, base) in [
+        ("gpt-6-astra-fast", "gpt-6-astra"),
+        // An unconfigured base still resolves; model tables are not an allowlist.
+        ("gpt-9-fast", "gpt-9"),
+    ] {
+        assert_eq!(provider.synthetic_fast_base(native), Some(base), "{native}");
+    }
     for native in [
         "gpt-5.4-fast",      // configured upstream ID stays literal
         "gpt-5.4-fast-fast", // the suffix never stacks
         "o4-mini-fast",      // not a gpt- model
-        "gpt-9-fast",        // base is not configured
         "gpt-6-astra",
     ] {
         assert_eq!(provider.synthetic_fast_base(native), None, "{native}");

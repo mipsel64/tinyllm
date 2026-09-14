@@ -3269,7 +3269,7 @@ async fn openai_model_defaults_and_client_overrides_reach_each_endpoint() {
             ("gpt-5.4", "gpt-5.4", Some("low"), "low"),
             ("gpt-5.4", "gpt-5.4", None, "xhigh"),
             ("gpt-5.4-fast", "gpt-5.4", None, "xhigh"),
-            ("gpt-9-fast", "gpt-9-fast", Some("low"), "low"),
+            ("gpt-9-fast", "gpt-9", Some("low"), "low"),
         ] {
             let mut body = if path.ends_with("/responses") {
                 json!({"input":"hello"})
@@ -3313,16 +3313,8 @@ async fn openai_model_defaults_and_client_overrides_reach_each_endpoint() {
                 assert_eq!(response["service_tier"], "default");
             }
             match native_model {
-                "gpt-5.4" => assert_eq!(upstream["service_tier"], "priority"),
-                // An unconfigured base forwards the name literally and keeps the client tier.
-                "gpt-9-fast" => assert_eq!(
-                    upstream["service_tier"],
-                    if path.starts_with("/anthropic") {
-                        "default"
-                    } else {
-                        "flex"
-                    }
-                ),
+                // An unconfigured base still resolves, so both take the fast tier.
+                "gpt-5.4" | "gpt-9" => assert_eq!(upstream["service_tier"], "priority"),
                 _ => assert!(upstream.get("service_tier").is_none()),
             }
         }

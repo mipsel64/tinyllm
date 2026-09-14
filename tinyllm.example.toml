@@ -126,10 +126,10 @@ type = "Subscription"
 # not an allowlist. Unlisted native IDs are forwarded too. Quote IDs containing
 # dots or slashes. Model availability depends on the upstream account.
 # Clients select the main/small/subagent model; there are no configurable aliases.
-# Each configured native ID beginning with gpt- also exposes a generated -fast
-# name that sends the base model with priority. Exact configured names stay literal,
-# so listing an upstream ID that itself ends in -fast keeps it verbatim; the suffix
-# never stacks.
+# Any native ID beginning with gpt- also accepts a generated -fast name that sends
+# the base model with priority, configured or not; discovery lists it for configured
+# IDs only. Exact configured names stay literal, so listing an upstream ID that itself
+# ends in -fast keeps it verbatim; the suffix never stacks.
 [providers.openai.models."gpt-5.6-sol"]
 # Optional fallback when the client omits effort. Client reasoning controls win.
 # Accepted values: none, minimal, low, medium, high, xhigh, max. Providers map
