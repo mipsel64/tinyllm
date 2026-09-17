@@ -122,6 +122,7 @@ async fn endpoint_formats_share_native_provider_routing_and_local_auth() {
             "openrouter".into(),
             ProviderConfig::OpenRouter(openrouter::models::Config {
                 api_key: "upstream-key".into(),
+                user_agent: None,
                 base_url: Some(upstream),
                 models: [(
                     "deepseek/deepseek-4-pro".into(),

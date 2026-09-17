@@ -182,6 +182,7 @@ async fn native_routes_preserve_models_extensions_and_allowed_headers() {
     let router = openrouter::OpenRouterProvider::new(
         openrouter::Config {
             api_key: "upstream-secret".into(),
+            user_agent: Some("openrouter-client/test".into()),
             base_url: Some(format!("{base}/api/v1/")),
             models: BTreeMap::from([(
                 "deepseek/deepseek-4-pro".into(),
@@ -195,6 +196,7 @@ async fn native_routes_preserve_models_extensions_and_allowed_headers() {
     let zai = zai::ZaiProvider::new(
         zai::Config {
             api_key: "upstream-secret".into(),
+            user_agent: Some("zai-client/test".into()),
             base_url: Some(format!("{base}/api/")),
             models: BTreeMap::from([(
                 "glm-5.3".into(),
@@ -255,6 +257,14 @@ async fn native_routes_preserve_models_extensions_and_allowed_headers() {
         assert_eq!(uri.path(), path);
         assert_eq!(uri.query(), Some("beta=true&value=a%2Fb"));
         assert_eq!(headers["authorization"], "Bearer upstream-secret");
+        assert_eq!(
+            headers["user-agent"],
+            if model == "glm-5.3" {
+                "zai-client/test"
+            } else {
+                "openrouter-client/test"
+            }
+        );
         assert!(!headers.contains_key("x-api-key"));
         assert!(!headers.contains_key("x-private"));
         assert_eq!(
@@ -626,6 +636,7 @@ async fn native_strips_foreign_reasoning_carriers_before_network() {
     let provider = zai::ZaiProvider::new(
         zai::Config {
             api_key: "secret".into(),
+            user_agent: None,
             base_url: Some("http://127.0.0.1:1".into()),
             models: BTreeMap::new(),
         },
@@ -718,6 +729,7 @@ async fn native_http_errors_preserve_status_headers_and_redact_credentials() {
         let provider = openrouter::OpenRouterProvider::new(
             openrouter::Config {
                 api_key: "upstream-secret".into(),
+                user_agent: None,
                 base_url: Some(format!("{base}/{path}")),
                 models: BTreeMap::new(),
             },

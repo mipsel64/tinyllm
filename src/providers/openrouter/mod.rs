@@ -103,6 +103,7 @@ impl Provider for OpenRouterProvider {
             &self.client,
             url.clone(),
             &self.config.api_key,
+            self.config.user_agent.as_deref(),
             request,
             context,
             self.limit,

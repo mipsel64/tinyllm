@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub api_key: String,
+    pub user_agent: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]

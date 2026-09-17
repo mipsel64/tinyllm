@@ -128,6 +128,9 @@ impl OpenAiProvider {
             ))
             .header("authorization", authorization)
             .json(body);
+        if let Some(user_agent) = &self.config.user_agent {
+            request = request.header(reqwest::header::USER_AGENT, user_agent);
+        }
         if let Some(org) = &self.config.organization {
             request = request.header("openai-organization", org);
         }

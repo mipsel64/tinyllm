@@ -1729,6 +1729,7 @@ fn config(base_url: String, state_dir: std::path::PathBuf) -> crate::config::Con
             "openai".into(),
             ProviderConfig::OpenAi(crate::providers::openai::models::Config {
                 base_url,
+                user_agent: None,
                 auth: OpenAiAuth::ApiKey("upstream-secret".into()),
                 organization: None,
                 project: None,
@@ -3036,6 +3037,7 @@ max_concurrent_requests = ${{{missing}:-2}}
 request_body_timeout_seconds = ${{{missing}:-7}}
 [providers.${{{missing}:-codex}}]
 type = "openai"
+user_agent = "${{{missing}:-codex_cli_rs/0.154.0 (macOS 26.6.2; arm64) tmux-256color}}"
 [providers.codex.auth]
 type = "ApiKey"
 options = "${{{missing}:-fixture-key}}"
@@ -3053,6 +3055,7 @@ service_tier = "priority"
 providers:
   "${{{missing}:-codex}}":
     type: openai
+    user_agent: "${{{missing}:-codex_cli_rs/0.154.0 (macOS 26.6.2; arm64) tmux-256color}}"
     auth:
       type: ApiKey
       options: "${{{missing}:-fixture-key}}"
@@ -3070,6 +3073,10 @@ providers:
             panic!("wrong provider variant")
         };
         assert_eq!(provider.auth.api_key().unwrap(), "fixture-key");
+        assert_eq!(
+            provider.user_agent.as_deref(),
+            Some("codex_cli_rs/0.154.0 (macOS 26.6.2; arm64) tmux-256color")
+        );
         assert_eq!(cfg.server.auth_token.as_deref(), Some("local-secret"));
         assert_eq!(cfg.server.max_concurrent_requests, Some(2));
         assert_eq!(cfg.server.request_body_timeout_seconds, 7);
@@ -3124,6 +3131,8 @@ providers:
         "[providers.openai]\ntype = 'openai'\n[providers.openai.auth]\ntype = 'ApiKey'\noptions = 'private-value'\nunknown = true",
         "[providers.openai]\ntype = 'openai'\n[providers.openai.auth]\ntype = 'ApiKey'\noptions = \"private-value",
         "[providers.openai]\ntype = 'openai'\nauth = 'api_key'\napi_key_env = 'private-value'",
+        "[providers.openai]\ntype = 'openai'\nuser_agent = ''\n[providers.openai.auth]\ntype = 'ApiKey'\noptions = 'fixture-key'",
+        "[providers.openai]\ntype = 'openai'\nuser_agent = \"codex\\ninvalid\"\n[providers.openai.auth]\ntype = 'ApiKey'\noptions = 'fixture-key'",
     ] {
         std::fs::write(&path, source).unwrap();
         let error = format!("{:#}", Config::load(&path).err().unwrap());

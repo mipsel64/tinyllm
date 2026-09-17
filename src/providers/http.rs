@@ -94,6 +94,7 @@ pub(crate) async fn forward(
     client: &Client,
     mut url: Url,
     key: &str,
+    user_agent: Option<&str>,
     request: ApiRequest,
     context: RequestContext,
     limit: usize,
@@ -110,6 +111,9 @@ pub(crate) async fn forward(
     value["model"] = Value::String(context.model);
     url.set_query(context.query.as_deref());
     let mut builder = client.post(url).bearer_auth(key).json(&value);
+    if let Some(user_agent) = user_agent {
+        builder = builder.header(reqwest::header::USER_AGENT, user_agent);
+    }
     if format == ApiFormat::Anthropic {
         for name in ["anthropic-version", "anthropic-beta"] {
             for value in context.headers.get_all(name) {

@@ -91,10 +91,15 @@ format = "compact"
 # Rename or add instances as needed; use openai login --provider NAME for subscriptions.
 # base_url values are API roots: endpoint paths are appended automatically.
 # HTTPS is required, except HTTP on loopback; no credentials/query/fragment in URLs.
+# Every provider accepts an optional user_agent override for upstream inference requests;
+# omitting it sends tinyllm/<version>. This changes only the User-Agent header.
 
 [providers.openai]
 # Supported types: openai, openrouter, zai (lowercase, case-sensitive).
 type = "openai"
+
+# Codex format: codex_cli_rs/<version> (<OS> <version>; <arch>) <terminal>.
+# user_agent = "codex_cli_rs/0.154.0 (macOS 26.6.2; arm64) tmux-256color"
 
 # Omit to select the backend from auth: Subscription uses
 # https://chatgpt.com/backend-api/codex; ApiKey uses https://api.openai.com/v1.
