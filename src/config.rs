@@ -79,6 +79,7 @@ impl Config {
             }
             match provider {
                 ProviderConfig::OpenAi(c) => {
+                    validate_user_agent(c.user_agent.as_deref())?;
                     let local = validate_url(c.base_url())?;
                     if c.auth.is_subscription() {
                         if !local
@@ -100,6 +101,7 @@ impl Config {
                     }
                 }
                 ProviderConfig::OpenRouter(c) => {
+                    validate_user_agent(c.user_agent.as_deref())?;
                     if !valid_key(&c.api_key) {
                         bail!(
                             "provider api_key must be nonempty without whitespace or control characters"
@@ -113,6 +115,7 @@ impl Config {
                     }
                 }
                 ProviderConfig::Zai(c) => {
+                    validate_user_agent(c.user_agent.as_deref())?;
                     if !valid_key(&c.api_key) {
                         bail!(
                             "provider api_key must be nonempty without whitespace or control characters"
@@ -190,6 +193,16 @@ fn resolve_path(value: &mut PathBuf, config: &Path) {
 }
 fn valid_key(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|b| b.is_ascii_graphic())
+}
+fn validate_user_agent(value: Option<&str>) -> Result<()> {
+    if value.is_some_and(|value| {
+        value.trim().is_empty()
+            || value.trim() != value
+            || reqwest::header::HeaderValue::from_bytes(value.as_bytes()).is_err()
+    }) {
+        bail!("provider user_agent must be a nonempty valid HTTP header value");
+    }
+    Ok(())
 }
 pub(crate) fn validate_model(model: &str) -> Result<()> {
     if model.is_empty()

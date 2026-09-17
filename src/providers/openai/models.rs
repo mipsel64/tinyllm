@@ -8,6 +8,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 pub struct Config {
     #[serde(default)]
     pub base_url: String,
+    pub user_agent: Option<String>,
     pub auth: OpenAiAuth,
     pub organization: Option<String>,
     pub project: Option<String>,

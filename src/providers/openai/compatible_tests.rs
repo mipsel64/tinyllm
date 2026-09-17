@@ -308,6 +308,7 @@ fn fast_suffix_resolves_gpt_models() {
     let provider = OpenAiProvider::new(
         Config {
             base_url: "https://api.openai.com/v1".into(),
+            user_agent: None,
             auth: OpenAiAuth::ApiKey("fixture-key".into()),
             organization: None,
             project: None,
@@ -382,6 +383,10 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
             let raw = raw.clone();
             async move {
                 assert_eq!(headers["authorization"], "Bearer fixture-key");
+                assert_eq!(
+                    headers["user-agent"],
+                    "codex_cli_rs/0.154.0 (macOS 26.6.2; arm64) tmux-256color"
+                );
                 assert_eq!(headers["chatgpt-account-id"], "account");
                 assert_eq!(body["stream"], true);
                 assert_eq!(body["service_tier"], "priority");
@@ -419,6 +424,7 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
     let provider = OpenAiProvider::new(
         Config {
             base_url: base,
+            user_agent: Some("codex_cli_rs/0.154.0 (macOS 26.6.2; arm64) tmux-256color".into()),
             auth: OpenAiAuth::Subscription(SubscriptionOptions {
                 credentials_dir: auth_dir,
             }),
@@ -621,6 +627,7 @@ async fn api_key_chat_json_and_fragmented_sse_roundtrip_two_tools() {
     let provider = OpenAiProvider::new(
         Config {
             base_url: base,
+            user_agent: None,
             auth: OpenAiAuth::ApiKey("fixture-key".into()),
             organization: None,
             project: None,
