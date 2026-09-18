@@ -44,7 +44,8 @@ pub fn native(mut body: Value, model: &Model, subscription: bool) -> Result<Valu
         {
             *input = json!([{"role":"user","content":[{"type":"input_text","text":input}]}]);
         }
-        for field in ["max_output_tokens", "truncation", "temperature", "top_p"] {
+        object.remove("max_output_tokens");
+        for field in ["truncation", "temperature", "top_p"] {
             if object.get(field).is_some_and(|v| !v.is_null()) {
                 return Err(Error::invalid(format!(
                     "{field} is unsupported by the Codex subscription backend"

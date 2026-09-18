@@ -20,15 +20,13 @@ fn native_options_and_reasoning_are_preserved() {
     assert_eq!(body["model"], "gpt-native");
     assert!(request::native(json!({"input":"hello","store":true}), &model(), false).is_err());
     assert!(request::native(json!({"input":"hello","background":true}), &model(), false).is_err());
-    assert!(
-        request::native(
-            json!({"input":"hello","max_output_tokens":20}),
-            &model(),
-            true
-        )
-        .is_err()
-    );
-    let subscription = request::native(json!({"input":"hello"}), &model(), true).unwrap();
+    let subscription = request::native(
+        json!({"input":"hello","max_output_tokens":20}),
+        &model(),
+        true,
+    )
+    .unwrap();
+    assert!(subscription.get("max_output_tokens").is_none());
     assert_eq!(subscription["stream"], true);
     assert_eq!(subscription["instructions"], "");
     assert_eq!(
