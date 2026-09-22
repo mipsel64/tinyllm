@@ -1,3 +1,5 @@
+pub mod anthropic;
+pub(crate) mod browser;
 pub mod http;
 pub mod openai;
 pub mod openrouter;

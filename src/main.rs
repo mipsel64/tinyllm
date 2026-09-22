@@ -52,6 +52,12 @@ enum Command {
         about = "Manage OpenAI subscription authentication"
     )]
     OpenAi(OpenAiCommand),
+    #[command(
+        name = "anthropic",
+        subcommand,
+        about = "Manage Anthropic subscription authentication"
+    )]
+    Anthropic(AnthropicCommand),
 }
 
 #[derive(Subcommand)]
@@ -63,6 +69,8 @@ enum OpenAiCommand {
             help = "Use a device code instead of a localhost browser callback"
         )]
         device_auth: bool,
+        #[arg(long, help = "Print the login URL without opening a browser")]
+        headless: bool,
         #[arg(long, default_value = "openai")]
         provider: String,
     },
@@ -71,6 +79,35 @@ enum OpenAiCommand {
         #[arg(long, default_value = "openai")]
         provider: String,
     },
+}
+
+#[derive(Subcommand)]
+enum AnthropicCommand {
+    /// Sign in with an Anthropic subscription.
+    Login {
+        #[arg(long, help = "Print the login URL without opening a browser")]
+        headless: bool,
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+    },
+    /// Remove tinyllm's locally stored Anthropic subscription credentials.
+    Logout {
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+    },
+}
+
+fn anthropic_credentials_dir<'a>(
+    config: &'a config::Config,
+    prefix: &str,
+) -> eyre::Result<&'a std::path::Path> {
+    let Some(config::ProviderConfig::Anthropic(anthropic)) = config.providers.get(prefix) else {
+        eyre::bail!("login and logout require a configured Anthropic provider");
+    };
+    let providers::anthropic::models::AnthropicAuth::Subscription(options) = &anthropic.auth else {
+        eyre::bail!("set the provider auth.type to Subscription before login or logout");
+    };
+    Ok(&options.credentials_dir)
 }
 
 #[tokio::main]
@@ -84,31 +121,64 @@ async fn main() -> eyre::Result<()> {
         config.logging.format = format;
     }
     logging::init(&config.logging)?;
-    if let Some(Command::OpenAi(command)) = cli.command {
-        let prefix = match &command {
-            OpenAiCommand::Login { provider, .. } | OpenAiCommand::Logout { provider } => provider,
-        };
-        let Some(config::ProviderConfig::OpenAi(openai)) = config.providers.get(prefix) else {
-            eyre::bail!("login and logout require a configured OpenAI provider");
-        };
-        let providers::openai::models::OpenAiAuth::Subscription(options) = &openai.auth else {
-            eyre::bail!("set the provider auth.type to Subscription before login or logout");
-        };
-        let session = providers::openai::auth::Session::open(&options.credentials_dir)?;
-        match command {
-            OpenAiCommand::Login { device_auth, .. } => {
-                tokio::select! {
-                    result = session.login(device_auth) => result?,
-                    _ = tokio::signal::ctrl_c() => eyre::bail!("login cancelled"),
+    match cli.command {
+        Some(Command::OpenAi(command)) => {
+            let prefix = match &command {
+                OpenAiCommand::Login { provider, .. } | OpenAiCommand::Logout { provider } => {
+                    provider
                 }
-                println!("Subscription login saved. Start tinyllm with the same config.");
+            };
+            let Some(config::ProviderConfig::OpenAi(openai)) = config.providers.get(prefix) else {
+                eyre::bail!("login and logout require a configured OpenAI provider");
+            };
+            let providers::openai::models::OpenAiAuth::Subscription(options) = &openai.auth else {
+                eyre::bail!("set the provider auth.type to Subscription before login or logout");
+            };
+            let session = providers::openai::auth::Session::open(&options.credentials_dir)?;
+            match command {
+                OpenAiCommand::Login {
+                    device_auth,
+                    headless,
+                    ..
+                } => {
+                    tokio::select! {
+                        result = session.login(device_auth, headless) => result?,
+                        _ = tokio::signal::ctrl_c() => eyre::bail!("login cancelled"),
+                    }
+                    println!("Subscription login saved. Start tinyllm with the same config.");
+                }
+                OpenAiCommand::Logout { .. } => {
+                    session.logout()?;
+                    println!("Local subscription credentials removed.");
+                }
             }
-            OpenAiCommand::Logout { .. } => {
-                session.logout()?;
-                println!("Local subscription credentials removed.");
-            }
+            return Ok(());
         }
-        return Ok(());
+        Some(Command::Anthropic(command)) => {
+            let prefix = match &command {
+                AnthropicCommand::Login { provider, .. }
+                | AnthropicCommand::Logout { provider } => provider,
+            };
+            let directory = anthropic_credentials_dir(&config, prefix)?;
+            let session = providers::anthropic::auth::Session::open(directory)?;
+            match command {
+                AnthropicCommand::Login { headless, .. } => {
+                    tokio::select! {
+                        result = session.login(headless) => result?,
+                        _ = tokio::signal::ctrl_c() => eyre::bail!("login cancelled"),
+                    }
+                    println!(
+                        "Anthropic subscription login saved. Start tinyllm with the same config."
+                    );
+                }
+                AnthropicCommand::Logout { .. } => {
+                    session.logout()?;
+                    println!("Local Anthropic subscription credentials removed.");
+                }
+            }
+            return Ok(());
+        }
+        None => {}
     }
     let bind = config.server.bind;
     let app = server::router(config).await?;
@@ -174,8 +244,38 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_cli_requires_subscription_provider_type() {
+        use super::anthropic_credentials_dir;
+        let subscription: tinyllm::config::Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "claude": {
+                    "type":"anthropic",
+                    "auth":{"type":"Subscription","options":{"credentials_dir":"private"}}
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            anthropic_credentials_dir(&subscription, "claude").unwrap(),
+            std::path::Path::new("private")
+        );
+        assert!(anthropic_credentials_dir(&subscription, "anthropic").is_err());
+
+        let api_key: tinyllm::config::Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "anthropic": {
+                    "type":"anthropic",
+                    "auth":{"type":"ApiKey","options":"fixture-key"}
+                }
+            }
+        }))
+        .unwrap();
+        assert!(anthropic_credentials_dir(&api_key, "anthropic").is_err());
+    }
+
+    #[test]
     fn cli_accepts_config_paths_and_reports_usage() {
-        use super::{Cli, Command, OpenAiCommand};
+        use super::{AnthropicCommand, Cli, Command, OpenAiCommand};
         use clap::{Parser, error::ErrorKind};
         assert_eq!(
             Cli::try_parse_from(["tinyllm"])
@@ -201,6 +301,9 @@ mod tests {
                 "openai",
                 "login",
                 "--device-auth",
+                "--headless",
+                "--provider",
+                "codex",
                 "-c",
                 "subscription.yaml",
             ],
@@ -208,10 +311,19 @@ mod tests {
             vec!["tinyllm", "openai", "-c", "subscription.yaml", "login"],
         ] {
             let device = args.contains(&"--device-auth");
+            let headless = args.contains(&"--headless");
+            let provider = if args.contains(&"codex") {
+                "codex"
+            } else {
+                "openai"
+            };
             let cli = Cli::try_parse_from(args).unwrap();
             assert!(matches!(&cli.command,
-                Some(Command::OpenAi(OpenAiCommand::Login { device_auth, provider }))
-                    if *device_auth == device && provider == "openai"));
+                Some(Command::OpenAi(OpenAiCommand::Login {
+                    device_auth,
+                    headless: parsed_headless,
+                    provider: parsed_provider,
+                })) if *device_auth == device && *parsed_headless == headless && parsed_provider == provider));
             assert_eq!(
                 cli.config_path().unwrap(),
                 std::path::Path::new("subscription.yaml")
@@ -233,6 +345,7 @@ mod tests {
                         OpenAiCommand::Login {
                             provider,
                             device_auth: false,
+                            headless: false,
                         },
                     )
                     | ("logout", OpenAiCommand::Logout { provider }) => provider,
@@ -241,7 +354,64 @@ mod tests {
                 assert_eq!(selected, provider.unwrap_or("openai"));
             }
         }
+        for provider in [None, Some("claude")] {
+            for action in ["login", "logout"] {
+                let mut args = vec!["tinyllm", "anthropic", action];
+                if let Some(provider) = provider {
+                    args.extend(["--provider", provider]);
+                }
+                let Some(Command::Anthropic(command)) = Cli::try_parse_from(args).unwrap().command
+                else {
+                    panic!("expected Anthropic command")
+                };
+                let selected = match (action, command) {
+                    (
+                        "login",
+                        AnthropicCommand::Login {
+                            provider,
+                            headless: false,
+                        },
+                    )
+                    | ("logout", AnthropicCommand::Logout { provider }) => provider,
+                    _ => panic!("wrong Anthropic command"),
+                };
+                assert_eq!(selected, provider.unwrap_or("anthropic"));
+            }
+        }
         for args in [
+            vec![
+                "tinyllm",
+                "anthropic",
+                "login",
+                "--headless",
+                "--provider",
+                "claude",
+                "-c",
+                "subscription.yaml",
+            ],
+            vec!["tinyllm", "-c", "subscription.yaml", "anthropic", "logout"],
+        ] {
+            let headless = args.contains(&"--headless");
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(
+                matches!(
+                    &cli.command,
+                    Some(Command::Anthropic(AnthropicCommand::Login {
+                        headless: parsed_headless,
+                        provider,
+                    })) if *parsed_headless == headless && provider == "claude"
+                ) || matches!(
+                    cli.command,
+                    Some(Command::Anthropic(AnthropicCommand::Logout { .. }))
+                )
+            );
+            assert_eq!(
+                cli.config_path().unwrap(),
+                std::path::Path::new("subscription.yaml")
+            );
+        }
+        for args in [
+            vec!["tinyllm", "anthropic"],
             vec!["tinyllm", "openai"],
             vec!["tinyllm", "login"],
             vec!["tinyllm", "logout"],
@@ -249,6 +419,9 @@ mod tests {
             assert!(Cli::try_parse_from(args).is_err());
         }
         for args in [
+            vec!["tinyllm", "anthropic", "--help"],
+            vec!["tinyllm", "anthropic", "login", "--help"],
+            vec!["tinyllm", "anthropic", "logout", "--help"],
             vec!["tinyllm", "openai", "--help"],
             vec!["tinyllm", "openai", "login", "--help"],
             vec!["tinyllm", "openai", "logout", "--help"],

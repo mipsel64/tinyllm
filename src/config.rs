@@ -1,7 +1,7 @@
 pub use crate::models::config::{Config, ProviderConfig, Server};
-use crate::providers::openai::models::OpenAiAuth;
+use crate::providers::{anthropic::models::AnthropicAuth, openai::models::OpenAiAuth};
 use eyre::{Result, WrapErr, bail};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -34,17 +34,30 @@ impl Config {
         }
         resolve_path(&mut config.server.state_dir, path);
         for (prefix, provider) in &mut config.providers {
-            if let ProviderConfig::OpenAi(openai) = provider
-                && let OpenAiAuth::Subscription(options) = &mut openai.auth
-            {
-                if options.credentials_dir.as_os_str().is_empty() {
-                    options.credentials_dir = config.server.state_dir.join("auth");
-                    if prefix != "openai" {
-                        options.credentials_dir.push(prefix);
+            match provider {
+                ProviderConfig::Anthropic(anthropic) => {
+                    if let AnthropicAuth::Subscription(options) = &mut anthropic.auth {
+                        if options.credentials_dir.as_os_str().is_empty() {
+                            options.credentials_dir =
+                                config.server.state_dir.join("auth").join(prefix);
+                        } else {
+                            resolve_path(&mut options.credentials_dir, path);
+                        }
                     }
-                } else {
-                    resolve_path(&mut options.credentials_dir, path);
                 }
+                ProviderConfig::OpenAi(openai) => {
+                    if let OpenAiAuth::Subscription(options) = &mut openai.auth {
+                        if options.credentials_dir.as_os_str().is_empty() {
+                            options.credentials_dir = config.server.state_dir.join("auth");
+                            if prefix != "openai" {
+                                options.credentials_dir.push(prefix);
+                            }
+                        } else {
+                            resolve_path(&mut options.credentials_dir, path);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         config.validate()?;
@@ -78,6 +91,48 @@ impl Config {
                 );
             }
             match provider {
+                ProviderConfig::Anthropic(c) => {
+                    validate_user_agent(c.user_agent.as_deref())?;
+                    let local = validate_url(
+                        c.base_url
+                            .as_deref()
+                            .unwrap_or("https://api.anthropic.com/v1"),
+                    )?;
+                    if let AnthropicAuth::Subscription(options) = &c.auth {
+                        if options
+                            .credentials_dir
+                            .components()
+                            .any(|component| component == Component::ParentDir)
+                        {
+                            bail!(
+                                "Anthropic credentials_dir must not contain '..'; use the direct directory path"
+                            );
+                        }
+                        if !local
+                            && c.base_url
+                                .as_deref()
+                                .unwrap_or("https://api.anthropic.com/v1")
+                                .trim_end_matches('/')
+                                != "https://api.anthropic.com/v1"
+                        {
+                            bail!(
+                                "Anthropic subscription auth requires the canonical Anthropic API (loopback allowed for fixtures)"
+                            );
+                        }
+                        if path_identity(&options.credentials_dir)?
+                            == path_identity(&self.server.state_dir.join("auth"))?
+                        {
+                            bail!(
+                                "Anthropic credentials must not use OpenAI's default auth directory"
+                            );
+                        }
+                    } else {
+                        c.auth.api_key()?;
+                    }
+                    for id in c.models.keys() {
+                        validate_model(id)?;
+                    }
+                }
                 ProviderConfig::OpenAi(c) => {
                     validate_user_agent(c.user_agent.as_deref())?;
                     let local = validate_url(c.base_url())?;
@@ -184,6 +239,35 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn path_identity(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::new();
+    let existing = loop {
+        match ancestor.canonicalize() {
+            Ok(path) => break path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().ok_or_else(|| {
+                    eyre::eyre!("cannot resolve Anthropic credential path identity")
+                })?;
+                missing.push(name.to_owned());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    eyre::eyre!("cannot resolve Anthropic credential path identity")
+                })?;
+            }
+            Err(_) => bail!("cannot resolve Anthropic credential path identity"),
+        }
+    };
+    Ok(missing
+        .into_iter()
+        .rev()
+        .fold(existing, |path, name| path.join(name)))
 }
 
 fn resolve_path(value: &mut PathBuf, config: &Path) {

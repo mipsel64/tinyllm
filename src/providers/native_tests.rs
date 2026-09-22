@@ -1,4 +1,4 @@
-use super::{Provider, http, openrouter, zai};
+use super::{Provider, anthropic, http, openrouter, zai};
 use crate::{
     config::Server,
     models::{ApiEvent, ApiFormat, ApiRequest, RequestContext, ResponseBody},
@@ -15,7 +15,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -76,6 +76,9 @@ fn native_model_options_validate_effort() {
             if let Ok(config) = &config {
                 use crate::config::ProviderConfig;
                 let configured = match &config.providers["fixture"] {
+                    ProviderConfig::Anthropic(_) => {
+                        unreachable!("anthropic models take no options")
+                    }
                     ProviderConfig::OpenAi(c) => c.models["native/model"].reasoning_effort,
                     ProviderConfig::OpenRouter(c) => c.models["native/model"].reasoning_effort,
                     ProviderConfig::Zai(c) => c.models["native/model"].reasoning_effort,
@@ -787,4 +790,575 @@ fn native_error_mapping_preserves_compaction_and_server_credential_semantics() {
             assert_eq!(error.kind, "overloaded_error");
         }
     }
+}
+
+fn anthropic_provider(base: &str, key: &str) -> anthropic::AnthropicProvider {
+    let server = Server::default();
+    anthropic::AnthropicProvider::new(
+        serde_json::from_value(json!({
+            "auth": {"type": "ApiKey", "options": key},
+            "user_agent": "anthropic-client/test",
+            "base_url": base,
+            "models": {"claude-sonnet-4-6": {}},
+        }))
+        .unwrap(),
+        http::client(&server).unwrap(),
+        server,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn anthropic_native_sends_api_key_and_round_trips_thinking_and_unknown_fields() {
+    let native_events = vec![
+        json!({
+            "type":"message_start",
+            "message":{"model":"claude-sonnet-4-6","content":"hi"}
+        }),
+        json!({
+            "type":"content_block_start", "index":0,
+            "content_block":{"type":"thinking","thinking":""}
+        }),
+        json!({
+            "type":"content_block_delta", "index":0,
+            "delta":{"type":"thinking_delta","thinking":"step"},
+            "provider_extension":{"keep":true}
+        }),
+        json!({
+            "type":"content_block_delta", "index":0,
+            "delta":{"type":"signature_delta","signature":"ErUBCkYIBRgCKkB0aGlzLWlz"}
+        }),
+        json!({"type":"content_block_stop","index":0}),
+        json!({
+            "type":"content_block_start", "index":1,
+            "content_block":{"type":"tool_use","id":"toolu_01","name":"lookup","input":{}}
+        }),
+        json!({
+            "type":"content_block_delta", "index":1,
+            "delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Hà Nội\"}"}
+        }),
+        json!({"type":"content_block_stop","index":1}),
+        json!({
+            "type":"message_delta",
+            "delta":{"stop_reason":"tool_use","stop_sequence":null},
+            "usage":{"output_tokens":12}
+        }),
+        json!({"type":"message_stop"}),
+    ];
+    let fixture_events = native_events.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+    let app = Router::new().fallback(post(
+        move |uri: Uri, headers: HeaderMap, Json(body): Json<Value>| {
+            let sender = sender.clone();
+            let fixture_events = fixture_events.clone();
+            async move {
+                let (status, content_type, payload) = if uri.path().starts_with("/rate") {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "application/json",
+                        json!({"error":{"type":"rate_limit_error","message":"upstream-secret is rate limited"}})
+                            .to_string(),
+                    )
+                } else if body["stream"] == true {
+                    (
+                        StatusCode::OK,
+                        "text/event-stream",
+                        fixture_events
+                            .iter()
+                            .map(|event| {
+                                format!(
+                                    "event: {}\ndata: {event}\n\n",
+                                    event["type"].as_str().unwrap()
+                                )
+                            })
+                            .collect(),
+                    )
+                } else {
+                    // Echoing the request proves both directions keep the blocks
+                    // and fields tinyllm does not model.
+                    let mut echo = body.clone();
+                    echo["type"] = json!("message");
+                    (StatusCode::OK, "application/json", echo.to_string())
+                };
+                sender.send((uri, headers, body)).await.unwrap();
+                (status, [("content-type", content_type)], payload)
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let provider = anthropic_provider(&format!("{base}/v1"), "upstream-secret");
+    assert_eq!(provider.models()[0].id, "claude-sonnet-4-6");
+
+    // A true signature, a provider-owned redacted_thinking block that is not a
+    // tinyllm carrier, and a field tinyllm does not know.
+    let blocks = json!([
+        {"type":"thinking","thinking":"step","signature":"ErUBCkYIBRgCKkB0aGlzLWlz"},
+        {"type":"redacted_thinking","data":"EroBCkYIBRgCKkBuYXRpdmUtb3BhcXVl"},
+        {"type":"text","text":"answer","cache_control":{"type":"ephemeral"}},
+        {"type":"tool_use","id":"toolu_01","name":"lookup","input":{"city":"Hà Nội"}}
+    ]);
+    let sent = json!({
+        "model": "router/claude-sonnet-4-6", "max_tokens": 128,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": blocks},
+            {"role": "user", "content": [{"type":"tool_result","tool_use_id":"toolu_01","content":"ok"}]},
+        ],
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "high"},
+        "provider_extension": {"keep": true},
+    });
+    let output = provider
+        .execute(
+            ApiRequest::parse(ApiFormat::Anthropic, sent.clone()).unwrap(),
+            context("claude-sonnet-4-6"),
+        )
+        .await
+        .unwrap();
+    let ResponseBody::Json(returned) = output.body else {
+        panic!("expected JSON")
+    };
+    let (uri, headers, upstream) = receiver.recv().await.unwrap();
+    assert_eq!(uri.path(), "/v1/messages");
+    assert_eq!(uri.query(), Some("beta=true&value=a%2Fb"));
+    assert_eq!(headers["x-api-key"], "upstream-secret");
+    assert!(!headers.contains_key("authorization"));
+    assert_eq!(headers["anthropic-version"], "2023-06-01");
+    assert_eq!(headers["anthropic-beta"], "test-beta");
+    assert_eq!(headers["user-agent"], "anthropic-client/test");
+    assert!(!headers.contains_key("x-private"));
+    let mut expected = sent.clone();
+    expected["model"] = json!("claude-sonnet-4-6");
+    expected["stream"] = json!(false);
+    assert_eq!(upstream, expected);
+    expected["model"] = json!("router/claude-sonnet-4-6");
+    expected["type"] = json!("message");
+    assert_eq!(returned, expected);
+
+    // Without a client anthropic-version the shared default is sent.
+    let mut plain = context("claude-sonnet-4-6");
+    plain.headers.remove("anthropic-version");
+    plain.headers.remove("anthropic-beta");
+    let mut streamed = sent.clone();
+    streamed["stream"] = json!(true);
+    let output = provider
+        .execute(
+            ApiRequest::parse(ApiFormat::Anthropic, streamed).unwrap(),
+            plain,
+        )
+        .await
+        .unwrap();
+    let ResponseBody::Stream(events) = output.body else {
+        panic!("expected SSE")
+    };
+    let returned_events = events
+        .map(|event| match event.unwrap() {
+            ApiEvent::Anthropic(value) => value,
+            _ => panic!("expected Anthropic"),
+        })
+        .collect::<Vec<_>>()
+        .await;
+    let mut expected_events = native_events;
+    expected_events[0]["message"]["model"] = json!("router/claude-sonnet-4-6");
+    assert_eq!(returned_events, expected_events);
+    let (_, headers, _) = receiver.recv().await.unwrap();
+    assert_eq!(headers["anthropic-version"], "2023-06-01");
+    assert!(!headers.contains_key("anthropic-beta"));
+
+    // OpenAI formats route through the same registry, so they must be refused
+    // before a request leaves the process.
+    for format in [ApiFormat::ChatCompletions, ApiFormat::Responses] {
+        let error = provider
+            .execute(
+                request(format, "claude-sonnet-4-6", false),
+                context("claude-sonnet-4-6"),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(receiver.try_recv().is_err());
+    }
+    assert_eq!(
+        provider
+            .convert_reasoning_effort("claude-sonnet-4-6", "high")
+            .unwrap_err()
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+
+    let error = anthropic_provider(&format!("{base}/rate/v1"), "upstream-secret")
+        .execute(
+            ApiRequest::parse(ApiFormat::Anthropic, sent).unwrap(),
+            context("claude-sonnet-4-6"),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(error.kind, "rate_limit_error");
+    assert!(!error.message.contains("upstream-secret"));
+    assert!(error.message.contains("[redacted]"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn anthropic_subscription_sends_bearer_beta_and_retries_only_one_401() {
+    let messages = Arc::new(AtomicUsize::new(0));
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+    let app = Router::new()
+        .route(
+            "/v1/oauth/token",
+            post({
+                let refreshes = refreshes.clone();
+                move |Json(body): Json<Value>| {
+                    let refreshes = refreshes.clone();
+                    async move {
+                        refreshes.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(body["grant_type"], "refresh_token");
+                        assert_eq!(body["refresh_token"], "refresh-old");
+                        assert_eq!(body["client_id"], "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+                        Json(json!({
+                            "access_token":"access-new",
+                            "refresh_token":"refresh-new",
+                            "expires_in":3600
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/messages",
+            post({
+                let messages = messages.clone();
+                move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let messages = messages.clone();
+                    let sender = sender.clone();
+                    async move {
+                        let call = messages.fetch_add(1, Ordering::SeqCst);
+                        sender.send(headers.clone()).await.unwrap();
+                        if call == 0 {
+                            assert_eq!(headers["authorization"], "Bearer access-old");
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({"error":{"message":"expired"}})),
+                            );
+                        }
+                        assert_eq!(headers["authorization"], "Bearer access-new");
+                        if call == 2 {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                Json(json!({"error":{"message":"denied"}})),
+                            );
+                        }
+                        let mut body = body;
+                        body["type"] = json!("message");
+                        (StatusCode::OK, Json(body))
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let directory =
+        std::env::temp_dir().join(format!("tinyllm-anthropic-native-{}", uuid::Uuid::new_v4()));
+    anthropic::auth::save_fixture(
+        &directory,
+        "access-old",
+        "refresh-old",
+        anthropic::auth::fixture_expiry(),
+    );
+    let server = Server::default();
+    let mut provider = anthropic::AnthropicProvider::new(
+        serde_json::from_value(json!({
+            "auth": {"type":"Subscription", "options":{"credentials_dir":directory.clone()}},
+            "base_url": format!("{base}/v1"),
+            "models": {"claude-sonnet-4-6": {}},
+        }))
+        .unwrap(),
+        http::client(&server).unwrap(),
+        server,
+    )
+    .unwrap();
+    provider.set_token_url(format!("{base}/v1/oauth/token"));
+    let request = json!({
+        "model":"router/claude-sonnet-4-6",
+        "max_tokens":32,
+        "messages":[{"role":"user","content":"hello"}]
+    });
+    provider
+        .execute(
+            ApiRequest::parse(ApiFormat::Anthropic, request.clone()).unwrap(),
+            context("claude-sonnet-4-6"),
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let headers = receiver.recv().await.unwrap();
+        assert!(!headers.contains_key("x-api-key"));
+        assert_eq!(headers["anthropic-version"], "2023-06-01");
+        let betas = headers
+            .get_all("anthropic-beta")
+            .iter()
+            .flat_map(|value| value.to_str().unwrap().split(','))
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        assert!(betas.contains(&"test-beta"));
+        assert_eq!(
+            betas
+                .iter()
+                .filter(|beta| **beta == "oauth-2025-04-20")
+                .count(),
+            1
+        );
+        assert!(!headers.contains_key("x-app"));
+        assert!(!headers.contains_key("x-stainless-helper-method"));
+    }
+    let error = match provider
+        .execute(
+            ApiRequest::parse(ApiFormat::Anthropic, request).unwrap(),
+            context("claude-sonnet-4-6"),
+        )
+        .await
+    {
+        Ok(_) => panic!("403 unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(messages.load(Ordering::SeqCst), 3);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert!(receiver.recv().await.is_some());
+    task.abort();
+    drop(provider);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn anthropic_config_requires_a_tagged_api_key_and_option_free_models() {
+    for (provider, valid) in [
+        (
+            json!({"type":"anthropic","auth":{"type":"ApiKey","options":"fixture-key"},
+                "models":{"claude-sonnet-4-6":{}}}),
+            true,
+        ),
+        (
+            json!({"type":"anthropic","auth":{"type":"ApiKey","options":"fixture-key"},
+                "base_url":"http://127.0.0.1:9/v1"}),
+            true,
+        ),
+        (
+            json!({"type":"anthropic","auth":{"type":"Subscription","options":{}}}),
+            true,
+        ),
+        (
+            json!({"type":"anthropic","auth":{"type":"Subscription"},
+                "base_url":"https://example.com/v1"}),
+            false,
+        ),
+        (json!({"type":"anthropic","api_key":"fixture-key"}), false),
+        (
+            json!({"type":"anthropic","auth":{"type":"ApiKey","options":""}}),
+            false,
+        ),
+        (
+            json!({"type":"anthropic","auth":{"type":"ApiKey","options":"has space"}}),
+            false,
+        ),
+        (
+            json!({"type":"anthropic","auth":{"type":"ApiKey","options":"fixture-key"},
+                "base_url":"http://api.anthropic.com/v1"}),
+            false,
+        ),
+        (
+            json!({"type":"anthropic","auth":{"type":"ApiKey","options":"fixture-key"},
+                "base_url":"https://api.anthropic.com/v1?beta=true"}),
+            false,
+        ),
+        (
+            json!({"type":"anthropic","auth":{"type":"ApiKey","options":"fixture-key"},
+                "models":{"claude-sonnet-4-6":{"reasoning_effort":"high"}}}),
+            false,
+        ),
+        (
+            json!({"type":"anthropic","auth":{"type":"ApiKey","options":"fixture-key"},
+                "user_agent":" trailing "}),
+            false,
+        ),
+    ] {
+        let config = serde_json::from_value::<crate::config::Config>(json!({
+            "providers": {"fixture": provider.clone()}
+        }));
+        assert_eq!(
+            config.is_ok_and(|config| config.validate().is_ok()),
+            valid,
+            "{provider}"
+        );
+    }
+}
+
+#[test]
+fn anthropic_provider_loads_from_toml_and_yaml() {
+    let directory =
+        std::env::temp_dir().join(format!("tinyllm-anthropic-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    for (name, text) in [
+        (
+            "config.toml",
+            "[server]\nstate_dir = \"state\"\n[providers.claude]\ntype = \"anthropic\"\n\
+             [providers.claude.auth]\ntype = \"ApiKey\"\noptions = \"fixture-key\"\n\
+             [providers.claude.models.\"claude-sonnet-4-6\"]\n",
+        ),
+        (
+            "config.yaml",
+            "server:\n  state_dir: state\nproviders:\n  claude:\n    type: anthropic\n\
+             \n    auth:\n      type: ApiKey\n      options: fixture-key\n\
+             \n    models:\n      claude-sonnet-4-6: {}\n",
+        ),
+    ] {
+        let path = directory.join(name);
+        std::fs::write(&path, text).unwrap();
+        let config = crate::config::Config::load(&path).unwrap();
+        let crate::config::ProviderConfig::Anthropic(provider) = &config.providers["claude"] else {
+            panic!("wrong provider variant")
+        };
+        assert_eq!(provider.auth.api_key().unwrap(), "fixture-key");
+        assert!(provider.models.contains_key("claude-sonnet-4-6"));
+        assert!(provider.base_url.is_none());
+    }
+
+    let path = directory.join("subscription.toml");
+    std::fs::write(
+        &path,
+        "[server]\nstate_dir = 'state'\n[providers.anthropic]\ntype = 'anthropic'\n\
+         [providers.anthropic.auth]\ntype = 'Subscription'\n",
+    )
+    .unwrap();
+    let config = crate::config::Config::load(&path).unwrap();
+    let crate::config::ProviderConfig::Anthropic(provider) = &config.providers["anthropic"] else {
+        panic!("wrong provider variant")
+    };
+    let anthropic::models::AnthropicAuth::Subscription(options) = &provider.auth else {
+        panic!("wrong auth variant")
+    };
+    assert_eq!(
+        options.credentials_dir,
+        directory.join("state/auth/anthropic")
+    );
+    assert_ne!(options.credentials_dir, directory.join("state/auth"));
+
+    std::fs::write(
+        &path,
+        "[server]\nstate_dir = 'state'\n[providers.claude]\ntype = 'anthropic'\n\
+         [providers.claude.auth]\ntype = 'Subscription'\n",
+    )
+    .unwrap();
+    let config = crate::config::Config::load(&path).unwrap();
+    let crate::config::ProviderConfig::Anthropic(provider) = &config.providers["claude"] else {
+        panic!("wrong provider variant")
+    };
+    let anthropic::models::AnthropicAuth::Subscription(options) = &provider.auth else {
+        panic!("wrong auth variant")
+    };
+    assert_eq!(options.credentials_dir, directory.join("state/auth/claude"));
+
+    std::fs::write(
+        &path,
+        "[server]\nstate_dir = 'state'\n[providers.claude]\ntype = 'anthropic'\n\
+         [providers.claude.auth]\ntype = 'Subscription'\noptions = { credentials_dir = 'relative-auth' }\n",
+    )
+    .unwrap();
+    let config = crate::config::Config::load(&path).unwrap();
+    let crate::config::ProviderConfig::Anthropic(provider) = &config.providers["claude"] else {
+        panic!("wrong provider variant")
+    };
+    let anthropic::models::AnthropicAuth::Subscription(options) = &provider.auth else {
+        panic!("wrong auth variant")
+    };
+    assert_eq!(options.credentials_dir, directory.join("relative-auth"));
+
+    std::fs::write(
+        &path,
+        "[server]\nstate_dir = 'state'\n[providers.claude]\ntype = 'anthropic'\n\
+         [providers.claude.auth]\ntype = 'Subscription'\noptions = { credentials_dir = 'state/auth' }\n",
+    )
+    .unwrap();
+    assert!(crate::config::Config::load(&path).is_err());
+
+    std::fs::write(
+        &path,
+        "[server]\nstate_dir = 'state'\n[providers.claude]\ntype = 'anthropic'\n\
+         [providers.claude.auth]\ntype = 'Subscription'\noptions = { credentials_dir = 'state/tmp/../auth' }\n",
+    )
+    .unwrap();
+    let error = match crate::config::Config::load(&path) {
+        Ok(_) => panic!("parent-directory alias unexpectedly loaded"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("must not contain '..'"));
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn anthropic_credentials_reject_absolute_alias_of_relative_openai_root() {
+    let relative_root =
+        std::path::PathBuf::from(format!(".tinyllm-anthropic-path-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&relative_root).unwrap();
+    let absolute_auth = std::env::current_dir()
+        .unwrap()
+        .join(&relative_root)
+        .join("state/auth");
+    let path = relative_root.join("config.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[server]\nstate_dir = 'state'\n[providers.claude]\ntype = 'anthropic'\n\
+             [providers.claude.auth]\ntype = 'Subscription'\noptions = {{ credentials_dir = {} }}\n",
+            serde_json::to_string(&absolute_auth.to_string_lossy()).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let error = match crate::config::Config::load(&path) {
+        Ok(_) => panic!("absolute alias of relative OpenAI root unexpectedly loaded"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("must not use OpenAI's default auth directory"));
+    assert!(!absolute_auth.exists());
+    std::fs::remove_dir_all(relative_root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn anthropic_credentials_reject_existing_symlink_ancestor_alias() {
+    use std::os::unix::fs::symlink;
+
+    let root =
+        std::env::temp_dir().join(format!("tinyllm-anthropic-alias-{}", uuid::Uuid::new_v4()));
+    let real = root.join("real");
+    let alias = root.join("alias");
+    std::fs::create_dir_all(&real).unwrap();
+    symlink(&real, &alias).unwrap();
+    let path = alias.join("config.toml");
+    let real_auth = real.join("state/auth");
+    std::fs::write(
+        &path,
+        format!(
+            "[server]\nstate_dir = 'state'\n[providers.claude]\ntype = 'anthropic'\n\
+             [providers.claude.auth]\ntype = 'Subscription'\noptions = {{ credentials_dir = {} }}\n",
+            serde_json::to_string(&real_auth.to_string_lossy()).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let error = match crate::config::Config::load(&path) {
+        Ok(_) => panic!("symlink ancestor alias of OpenAI root unexpectedly loaded"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("must not use OpenAI's default auth directory"));
+    assert!(!real_auth.exists());
+    std::fs::remove_dir_all(root).unwrap();
 }

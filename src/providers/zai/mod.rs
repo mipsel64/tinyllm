@@ -7,7 +7,7 @@ use crate::{
     config::Server,
     error::Error,
     models::{ApiFormat, ApiRequest, ModelInfo, ProviderOutput, RequestContext},
-    providers::{Provider, http, validate_effort},
+    providers::{Provider, http, http::Auth, validate_effort},
 };
 use reqwest::{Client, Url};
 
@@ -112,7 +112,7 @@ impl Provider for ZaiProvider {
         http::forward(
             &self.client,
             url.clone(),
-            &self.config.api_key,
+            Auth::Bearer(&self.config.api_key),
             self.config.user_agent.as_deref(),
             request,
             context,
