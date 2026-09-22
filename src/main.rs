@@ -69,6 +69,8 @@ enum OpenAiCommand {
             help = "Use a device code instead of a localhost browser callback"
         )]
         device_auth: bool,
+        #[arg(long, help = "Print the login URL without opening a browser")]
+        headless: bool,
         #[arg(long, default_value = "openai")]
         provider: String,
     },
@@ -83,6 +85,8 @@ enum OpenAiCommand {
 enum AnthropicCommand {
     /// Sign in with an Anthropic subscription.
     Login {
+        #[arg(long, help = "Print the login URL without opening a browser")]
+        headless: bool,
         #[arg(long, default_value = "anthropic")]
         provider: String,
     },
@@ -132,9 +136,13 @@ async fn main() -> eyre::Result<()> {
             };
             let session = providers::openai::auth::Session::open(&options.credentials_dir)?;
             match command {
-                OpenAiCommand::Login { device_auth, .. } => {
+                OpenAiCommand::Login {
+                    device_auth,
+                    headless,
+                    ..
+                } => {
                     tokio::select! {
-                        result = session.login(device_auth) => result?,
+                        result = session.login(device_auth, headless) => result?,
                         _ = tokio::signal::ctrl_c() => eyre::bail!("login cancelled"),
                     }
                     println!("Subscription login saved. Start tinyllm with the same config.");
@@ -148,16 +156,15 @@ async fn main() -> eyre::Result<()> {
         }
         Some(Command::Anthropic(command)) => {
             let prefix = match &command {
-                AnthropicCommand::Login { provider } | AnthropicCommand::Logout { provider } => {
-                    provider
-                }
+                AnthropicCommand::Login { provider, .. }
+                | AnthropicCommand::Logout { provider } => provider,
             };
             let directory = anthropic_credentials_dir(&config, prefix)?;
             let session = providers::anthropic::auth::Session::open(directory)?;
             match command {
-                AnthropicCommand::Login { .. } => {
+                AnthropicCommand::Login { headless, .. } => {
                     tokio::select! {
-                        result = session.login() => result?,
+                        result = session.login(headless) => result?,
                         _ = tokio::signal::ctrl_c() => eyre::bail!("login cancelled"),
                     }
                     println!(
@@ -294,6 +301,9 @@ mod tests {
                 "openai",
                 "login",
                 "--device-auth",
+                "--headless",
+                "--provider",
+                "codex",
                 "-c",
                 "subscription.yaml",
             ],
@@ -301,10 +311,19 @@ mod tests {
             vec!["tinyllm", "openai", "-c", "subscription.yaml", "login"],
         ] {
             let device = args.contains(&"--device-auth");
+            let headless = args.contains(&"--headless");
+            let provider = if args.contains(&"codex") {
+                "codex"
+            } else {
+                "openai"
+            };
             let cli = Cli::try_parse_from(args).unwrap();
             assert!(matches!(&cli.command,
-                Some(Command::OpenAi(OpenAiCommand::Login { device_auth, provider }))
-                    if *device_auth == device && provider == "openai"));
+                Some(Command::OpenAi(OpenAiCommand::Login {
+                    device_auth,
+                    headless: parsed_headless,
+                    provider: parsed_provider,
+                })) if *device_auth == device && *parsed_headless == headless && parsed_provider == provider));
             assert_eq!(
                 cli.config_path().unwrap(),
                 std::path::Path::new("subscription.yaml")
@@ -326,6 +345,7 @@ mod tests {
                         OpenAiCommand::Login {
                             provider,
                             device_auth: false,
+                            headless: false,
                         },
                     )
                     | ("logout", OpenAiCommand::Logout { provider }) => provider,
@@ -345,7 +365,13 @@ mod tests {
                     panic!("expected Anthropic command")
                 };
                 let selected = match (action, command) {
-                    ("login", AnthropicCommand::Login { provider })
+                    (
+                        "login",
+                        AnthropicCommand::Login {
+                            provider,
+                            headless: false,
+                        },
+                    )
                     | ("logout", AnthropicCommand::Logout { provider }) => provider,
                     _ => panic!("wrong Anthropic command"),
                 };
@@ -353,11 +379,32 @@ mod tests {
             }
         }
         for args in [
-            vec!["tinyllm", "anthropic", "login", "-c", "subscription.yaml"],
+            vec![
+                "tinyllm",
+                "anthropic",
+                "login",
+                "--headless",
+                "--provider",
+                "claude",
+                "-c",
+                "subscription.yaml",
+            ],
             vec!["tinyllm", "-c", "subscription.yaml", "anthropic", "logout"],
         ] {
+            let headless = args.contains(&"--headless");
             let cli = Cli::try_parse_from(args).unwrap();
-            assert!(matches!(cli.command, Some(Command::Anthropic(_))));
+            assert!(
+                matches!(
+                    &cli.command,
+                    Some(Command::Anthropic(AnthropicCommand::Login {
+                        headless: parsed_headless,
+                        provider,
+                    })) if *parsed_headless == headless && provider == "claude"
+                ) || matches!(
+                    cli.command,
+                    Some(Command::Anthropic(AnthropicCommand::Logout { .. }))
+                )
+            );
             assert_eq!(
                 cli.config_path().unwrap(),
                 std::path::Path::new("subscription.yaml")

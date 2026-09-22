@@ -333,9 +333,9 @@ impl Session {
         )
     }
 
-    pub async fn login(&self, device: bool) -> Result<()> {
+    pub async fn login(&self, device: bool, headless: bool) -> Result<()> {
         let credentials = if device {
-            self.login_device().await?
+            self.login_device(headless).await?
         } else {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:1455").await
                 .wrap_err_with(|| "cannot bind OAuth callback port 1455; close the other login or use --device-auth")?;
@@ -352,6 +352,7 @@ impl Session {
             );
             let url = authorize_url(&self.issuer, &challenge, &state)?;
             println!("Open this URL in your browser to sign in:\n\n{url}\n");
+            crate::providers::browser::open(url.as_str(), headless);
             let code = tokio::time::timeout(Duration::from_secs(300), callback(listener, state))
                 .await
                 .wrap_err_with(|| "browser login timed out after five minutes")??;
@@ -360,7 +361,7 @@ impl Session {
         self.save(&credentials)
     }
 
-    async fn login_device(&self) -> Result<Credentials> {
+    async fn login_device(&self, headless: bool) -> Result<Credentials> {
         let response = self
             .client
             .post(format!("{}/api/accounts/deviceauth/usercode", self.issuer))
@@ -383,10 +384,12 @@ impl Session {
         if !valid_secret(&device.user_code) || !valid_secret(&device.device_auth_id) {
             bail!("OpenAI returned an invalid device code");
         }
+        let url = format!("{}/codex/device", self.issuer);
         println!(
-            "Open {}/codex/device and enter {} (expires in {expires} seconds).",
-            self.issuer, device.user_code
+            "Open {url} and enter {} (expires in {expires} seconds).",
+            device.user_code
         );
+        crate::providers::browser::open(&url, headless);
         tokio::time::timeout(Duration::from_secs(expires), async {
             loop {
                 let response = self.client.post(format!("{}/api/accounts/deviceauth/token", self.issuer))

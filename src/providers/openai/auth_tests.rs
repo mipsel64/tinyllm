@@ -175,7 +175,7 @@ async fn device_login_polls_persists_and_reopens_private_credentials() {
     let mut session = Session::open(&path).unwrap();
     session.issuer = issuer;
     assert!(Session::open(&path).is_err());
-    session.login(true).await.unwrap();
+    session.login(true, true).await.unwrap();
     assert_eq!(polls.load(Ordering::SeqCst), 2);
     drop(session);
     let session = Session::open(&path).unwrap();

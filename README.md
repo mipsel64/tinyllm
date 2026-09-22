@@ -69,10 +69,15 @@ tinyllm openai login
 tinyllm
 ```
 
-The example uses subscription auth and listens on `127.0.0.1:8080`. Login prints a
-browser link; use `tinyllm openai login --device-auth` on a headless machine.
-Stop the gateway before login/logout for either subscription provider. For a
-renamed OpenAI provider, add `--provider NAME` to login/logout.
+The example uses subscription auth and listens on `127.0.0.1:8080`. Login
+prints its URL, then attempts to open it in the system browser. If no supported
+browser launcher is available, use the printed URL manually. Add `--headless`
+to either provider's `login` command to skip only the browser launch; the
+localhost callback is unchanged and must still be reachable. For remote OpenAI
+logins, `--device-auth` avoids the localhost callback and opens its verification
+URL unless combined with `--headless`. Stop the gateway before login/logout for
+either subscription provider. For a renamed OpenAI provider, add
+`--provider NAME` to login/logout.
 
 For an OpenAI API key, replace the auth section in your config:
 
@@ -86,9 +91,10 @@ Export `OPENAI_API_KEY` and start `tinyllm`; skip login. OpenRouter and Z.ai use
 the `api_key` settings shown in [tinyllm.example.toml](tinyllm.example.toml).
 Anthropic uses the same tagged `auth` block. `ApiKey` sends `options` upstream as
 `x-api-key`, never as a bearer token. For subscription OAuth, set
-`type = "Subscription"`, run `tinyllm anthropic login`, and use `--provider NAME` for a
-renamed provider. Login uses a five-minute localhost browser callback; refresh is
-automatic. `tinyllm anthropic logout` removes only the selected provider's local
+`type = "Subscription"`, run `tinyllm anthropic login`, and use
+`--provider NAME` for a renamed provider. Login uses a five-minute localhost
+browser callback and opens the printed URL by default; refresh is automatic.
+`tinyllm anthropic logout` removes only the selected provider's local
 credentials. OAuth availability, acceptable third-party use, account entitlement,
 and billing treatment remain Anthropic policy decisions; login does not guarantee
 any of them. Your local gateway token is never forwarded.

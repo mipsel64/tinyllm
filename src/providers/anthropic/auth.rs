@@ -306,7 +306,7 @@ impl Session {
         )
     }
 
-    pub async fn login(&self) -> Result<()> {
+    pub async fn login(&self, headless: bool) -> Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:53692")
             .await
             .wrap_err_with(
@@ -325,6 +325,7 @@ impl Session {
         );
         let url = authorize_url(AUTHORIZE_URL, &challenge, &state)?;
         println!("Open this URL in your browser to sign in:\n\n{url}\n");
+        crate::providers::browser::open(url.as_str(), headless);
         let (code, returned_state) =
             tokio::time::timeout(Duration::from_secs(300), callback(listener, state))
                 .await
