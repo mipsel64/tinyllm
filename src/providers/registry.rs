@@ -1,5 +1,6 @@
 use super::{
-    Provider, http, openai::OpenAiProvider, openrouter::OpenRouterProvider, zai::ZaiProvider,
+    Provider, anthropic::AnthropicProvider, http, openai::OpenAiProvider,
+    openrouter::OpenRouterProvider, zai::ZaiProvider,
 };
 use crate::{
     Result,
@@ -19,6 +20,11 @@ impl Registry {
         let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
         for (name, provider) in &config.providers {
             let provider: Arc<dyn Provider> = match provider {
+                ProviderConfig::Anthropic(c) => Arc::new(AnthropicProvider::new(
+                    c.clone(),
+                    client.clone(),
+                    config.server.clone(),
+                )?),
                 ProviderConfig::OpenAi(c) => Arc::new(OpenAiProvider::new(
                     c.clone(),
                     client.clone(),

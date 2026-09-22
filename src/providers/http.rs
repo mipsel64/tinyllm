@@ -90,15 +90,35 @@ pub(crate) fn endpoint(base: &str, path: &str) -> eyre::Result<Url> {
         .map_err(|_| eyre::eyre!("cannot parse provider endpoint"))
 }
 
-pub(crate) async fn forward(
-    client: &Client,
+#[derive(Clone, Copy)]
+pub(crate) enum Auth<'a> {
+    Bearer(&'a str),
+    ApiKey(&'a str),
+}
+
+impl<'a> Auth<'a> {
+    pub(crate) fn key(self) -> &'a str {
+        match self {
+            Self::Bearer(key) | Self::ApiKey(key) => key,
+        }
+    }
+}
+
+pub(crate) struct ForwardRequest {
+    url: Url,
+    value: Value,
+    format: ApiFormat,
+    streaming: bool,
+    context: RequestContext,
+    user_agent: Option<String>,
+}
+
+pub(crate) fn prepare(
     mut url: Url,
-    key: &str,
-    user_agent: Option<&str>,
     request: ApiRequest,
     context: RequestContext,
-    limit: usize,
-) -> Result<ProviderOutput> {
+    user_agent: Option<&str>,
+) -> Result<ForwardRequest> {
     let format = request.format;
     let streaming = request.body.stream;
     let mut value = request.into_value();
@@ -108,29 +128,82 @@ pub(crate) async fn forward(
             "background Responses require lifecycle endpoints that tinyllm does not expose",
         ));
     }
-    value["model"] = Value::String(context.model);
+    value["model"] = Value::String(context.model.clone());
     url.set_query(context.query.as_deref());
-    let mut builder = client.post(url).bearer_auth(key).json(&value);
-    if let Some(user_agent) = user_agent {
+    Ok(ForwardRequest {
+        url,
+        value,
+        format,
+        streaming,
+        context,
+        user_agent: user_agent.map(str::to_owned),
+    })
+}
+
+pub(crate) async fn send(
+    client: &Client,
+    request: &ForwardRequest,
+    auth: Auth<'_>,
+    extra_anthropic_beta: Option<&str>,
+) -> Result<Response> {
+    let mut builder = client.post(request.url.clone()).json(&request.value);
+    builder = match auth {
+        Auth::Bearer(key) => builder.bearer_auth(key),
+        Auth::ApiKey(key) => {
+            let mut header = reqwest::header::HeaderValue::from_str(key)
+                .map_err(|_| Error::upstream("provider api key is not a valid header value"))?;
+            header.set_sensitive(true);
+            builder.header("x-api-key", header)
+        }
+    };
+    if let Some(user_agent) = &request.user_agent {
         builder = builder.header(reqwest::header::USER_AGENT, user_agent);
     }
-    if format == ApiFormat::Anthropic {
-        for name in ["anthropic-version", "anthropic-beta"] {
-            for value in context.headers.get_all(name) {
-                builder = builder.header(name, value);
-            }
+    if request.format == ApiFormat::Anthropic {
+        for value in request.context.headers.get_all("anthropic-version") {
+            builder = builder.header("anthropic-version", value);
         }
-        if !context.headers.contains_key("anthropic-version") {
+        if !request.context.headers.contains_key("anthropic-version") {
             builder = builder.header("anthropic-version", "2023-06-01");
         }
+        let has_extra = extra_anthropic_beta.is_some_and(|extra| {
+            request
+                .context
+                .headers
+                .get_all("anthropic-beta")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(','))
+                .any(|value| value.trim() == extra)
+        });
+        for value in request.context.headers.get_all("anthropic-beta") {
+            builder = builder.header("anthropic-beta", value);
+        }
+        if let Some(extra) = extra_anthropic_beta.filter(|_| !has_extra) {
+            builder = builder.header("anthropic-beta", extra);
+        }
     }
-    let response = builder.send().await.map_err(|error| {
+    builder.send().await.map_err(|error| {
         Error::upstream(if error.is_timeout() {
             "upstream request timed out"
         } else {
             "cannot connect to upstream"
         })
-    })?;
+    })
+}
+
+pub(crate) async fn receive(
+    response: Response,
+    request: ForwardRequest,
+    key: &str,
+    limit: usize,
+) -> Result<ProviderOutput> {
+    let ForwardRequest {
+        format,
+        streaming,
+        context,
+        ..
+    } = request;
     let status = response.status();
     let mut headers = HeaderMap::new();
     copy_headers(response.headers(), &mut headers);
@@ -195,6 +268,21 @@ pub(crate) async fn forward(
         ResponseBody::Json(value)
     };
     Ok(ProviderOutput { headers, body })
+}
+
+pub(crate) async fn forward(
+    client: &Client,
+    url: Url,
+    auth: Auth<'_>,
+    user_agent: Option<&str>,
+    request: ApiRequest,
+    context: RequestContext,
+    limit: usize,
+) -> Result<ProviderOutput> {
+    let key = auth.key();
+    let request = prepare(url, request, context, user_agent)?;
+    let response = send(client, &request, auth, None).await?;
+    receive(response, request, key, limit).await
 }
 
 /// OpenAI reasoning carriers are provider-specific, so a model switch drops them

@@ -22,10 +22,9 @@ bind = "127.0.0.1:8080"
 # Empty/whitespace tokens are invalid; omit the setting to disable it.
 # auth_token = "${TINYLLM_TOKEN:-}"
 
-# Default subscription auth folder. Default: XDG_STATE_HOME/tinyllm when
-# XDG_STATE_HOME is absolute, otherwise HOME/.local/state/tinyllm.
-# Credentials live in auth/openai.json. The gateway keeps no conversation
-# state: OpenAI reasoning travels with the client, so restarts and multiple
+# Default: XDG_STATE_HOME/tinyllm when absolute, otherwise
+# HOME/.local/state/tinyllm. OpenAI uses auth/openai.json; Anthropic uses
+# auth/PROVIDER/anthropic.json. The gateway keeps no conversation state: OpenAI reasoning travels with the client, so restarts and multiple
 # gateway instances resume conversations without shared storage.
 # state_dir = "/custom/state/tinyllm"
 
@@ -95,7 +94,7 @@ format = "compact"
 # omitting it sends tinyllm/<version>. This changes only the User-Agent header.
 
 [providers.openai]
-# Supported types: openai, openrouter, zai (lowercase, case-sensitive).
+# Supported types: openai, openrouter, zai, anthropic (lowercase, case-sensitive).
 type = "openai"
 
 # Codex format: codex_cli_rs/<version> (<OS> <version>; <arch>) <terminal>.
@@ -180,3 +179,31 @@ reasoning_effort = "medium"
 # base_url = "https://api.z.ai/api" # Default; do not append /anthropic yourself.
 # [providers.zai.models."glm-5.3"]
 # reasoning_effort = "high" # Optional fallback; client controls take precedence.
+
+# Optional native Anthropic provider. Clients request
+# anthropic/claude-sonnet-4-6. Messages requests pass through
+# unchanged, keeping thinking signatures, tool results, cache_control and fields
+# tinyllm does not model; /v1/chat/completions and /v1/responses are rejected for
+# this provider, because it speaks only the Anthropic Messages API.
+# Choose ApiKey or Subscription. ApiKey sends options as x-api-key. Subscription
+# sends a bearer token plus the oauth-2025-04-20 beta; run `tinyllm anthropic login`
+# first (add --provider NAME for renamed tables). It refreshes before expiry and
+# once after a 401. OAuth login does not guarantee acceptable third-party use,
+# inference entitlement, or subscription-inclusive billing; Anthropic controls
+# those policies. The default credential file is
+# server.state_dir/auth/PROVIDER/anthropic.json. A custom private directory may
+# be relative to this config, but must not contain `..` or use OpenAI's default
+# auth directory.
+# [providers.anthropic]
+# type = "anthropic"
+# base_url = "https://api.anthropic.com/v1" # Default; /messages is appended.
+# [providers.anthropic.auth]
+# type = "Subscription"
+# options = { credentials_dir = "private-anthropic-auth" } # Optional.
+#
+# For an API key, replace the two lines above with:
+# type = "ApiKey"
+# options = "${ANTHROPIC_API_KEY:-}"
+# Model entries are discovery only and take no options: reasoning and output
+# format travel with the request, so there is nothing to default or cap here.
+# [providers.anthropic.models."claude-sonnet-4-6"]

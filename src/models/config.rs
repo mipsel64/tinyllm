@@ -1,4 +1,4 @@
-use crate::providers::{openai, openrouter, zai};
+use crate::providers::{anthropic, openai, openrouter, zai};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
 
@@ -15,6 +15,7 @@ pub struct Config {
 #[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProviderConfig {
+    Anthropic(anthropic::models::Config),
     OpenAi(openai::models::Config),
     OpenRouter(openrouter::models::Config),
     Zai(zai::models::Config),
