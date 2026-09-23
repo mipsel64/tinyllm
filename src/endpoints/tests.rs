@@ -220,9 +220,10 @@ async fn endpoint_formats_share_native_provider_routing_and_local_auth() {
         .await
         .unwrap();
     assert_eq!(
-        response["data"][0]["id"],
+        response["configured_models"][0]["id"],
         "openrouter/deepseek/deepseek-4-pro"
     );
+    assert!(response.get("data").is_none());
     assert_eq!(response["object"], "list");
     assert_eq!(
         response["providers"],

@@ -169,7 +169,7 @@ and your local gateway token as its API key (`tinyllm` when auth is disabled).
 | Chat Completions | `POST /v1/chat/completions` | `GET /v1/models` |
 | Responses | `POST /v1/responses` | `GET /v1/models` |
 
-`GET /v1/models` remains OpenAI-compatible and returns only the standard `data` list of explicitly configured model IDs. `GET /api/v1/models` returns the same list plus a `providers` list with each configured provider's public prefix, implementation type, and non-secret authentication family. Clients with their own model catalogs can therefore discover providers whose `models` map is empty without tinyllm duplicating a catalog.
+`GET /v1/models` remains OpenAI-compatible and returns only the standard `data` list of explicitly configured model IDs. `GET /api/v1/models` returns those IDs as `configured_models` plus a `providers` list with each configured provider's public prefix, implementation type, and non-secret authentication family. Clients with their own model catalogs can therefore discover providers whose `models` map is empty without tinyllm duplicating a catalog.
 
 `GET /anthropic/api/hello` returns `{"ok":true}` and is the only route served
 without a gateway token: Claude Code warms its connection pool against it before
