@@ -3,6 +3,7 @@ use crate::{
     endpoints::{
         Endpoint,
         anthropic::{AnthropicEndpoint, HELLO_PATH},
+        api::ApiEndpoint,
         endpoint::error_response,
         openai::OpenAiEndpoint,
     },
@@ -50,6 +51,7 @@ pub async fn router(config: Config) -> eyre::Result<Router> {
     Ok(Router::new()
         .merge(AnthropicEndpoint.router())
         .merge(OpenAiEndpoint.router())
+        .merge(ApiEndpoint.router())
         .fallback(|req: Request| async move {
             error_response(
                 Error {

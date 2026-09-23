@@ -25,7 +25,20 @@ async fn responses(State(app): State<Arc<AppState>>, request: Request) -> Respon
     endpoint::execute(app, request, ApiFormat::Responses).await
 }
 async fn models(State(app): State<Arc<AppState>>) -> Json<Value> {
-    Json(
-        json!({"object":"list","data":app.providers.models().iter().map(|m|json!({"id":m.id,"object":"model","created":0,"owned_by":m.id.split('/').next().unwrap_or("")})).collect::<Vec<_>>()}),
-    )
+    Json(json!({"object": "list", "data": model_data(&app)}))
+}
+
+fn model_data(app: &AppState) -> Vec<Value> {
+    app.providers
+        .models()
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "object": "model",
+                "created": 0,
+                "owned_by": m.id.split('/').next().unwrap_or(""),
+            })
+        })
+        .collect()
 }
