@@ -1,6 +1,6 @@
 use crate::{
     config::{Config, ProviderConfig, Server},
-    providers::openrouter,
+    providers::{openrouter, zai},
     server,
 };
 use axum::{Json, Router, extract::Request, routing::post};
@@ -118,20 +118,32 @@ async fn endpoint_formats_share_native_provider_routing_and_local_auth() {
             ..Default::default()
         },
         logging: Default::default(),
-        providers: [(
-            "openrouter".into(),
-            ProviderConfig::OpenRouter(openrouter::models::Config {
-                api_key: "upstream-key".into(),
-                user_agent: None,
-                base_url: Some(upstream),
-                models: [(
-                    "deepseek/deepseek-4-pro".into(),
-                    openrouter::models::Model::default(),
-                )]
-                .into(),
-            }),
-        )]
-        .into(),
+        providers: vec![
+            (
+                "openrouter".into(),
+                ProviderConfig::OpenRouter(openrouter::models::Config {
+                    api_key: "upstream-key".into(),
+                    user_agent: None,
+                    base_url: Some(upstream),
+                    models: [(
+                        "deepseek/deepseek-4-pro".into(),
+                        openrouter::models::Model::default(),
+                    )]
+                    .into(),
+                }),
+            ),
+            (
+                "zai-empty".into(),
+                ProviderConfig::Zai(zai::models::Config {
+                    api_key: "fixture-key".into(),
+                    user_agent: None,
+                    base_url: None,
+                    models: Default::default(),
+                }),
+            ),
+        ]
+        .into_iter()
+        .collect(),
     };
     let (gateway, task) = serve(server::router(config).await.unwrap()).await;
     let client = reqwest::Client::new();
@@ -193,10 +205,32 @@ async fn endpoint_formats_share_native_provider_routing_and_local_auth() {
             response["data"][0]["id"],
             "openrouter/deepseek/deepseek-4-pro"
         );
+        assert!(response.get("providers").is_none());
         if path == "/v1/models" {
             assert_eq!(response["object"], "list");
         }
     }
+    let response = client
+        .get(format!("{gateway}/api/v1/models"))
+        .bearer_auth("local-key")
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        response["data"][0]["id"],
+        "openrouter/deepseek/deepseek-4-pro"
+    );
+    assert_eq!(response["object"], "list");
+    assert_eq!(
+        response["providers"],
+        json!([
+            {"id":"openrouter","type":"openrouter","auth":"api_key"},
+            {"id":"zai-empty","type":"zai","auth":"api_key"}
+        ])
+    );
     task.abort();
     up_task.abort();
 }
