@@ -10,6 +10,8 @@ pub struct Config {
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
+    pub claude_code_version: Option<String>,
+    #[serde(default)]
     pub models: BTreeMap<String, Model>,
 }
 

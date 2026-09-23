@@ -35,7 +35,13 @@ subscription billing includes requests sent through tinyllm. API/account policy 
 upstream-controlled.
 Token counting is answered locally with `o200k_base` plus estimates for images
 and framing; it sizes context, it is not a billing count — `count_tokens` is never
-forwarded to Anthropic, so it does not match their counter exactly. OpenAI subscription
+forwarded to Anthropic, so it does not match their counter exactly. Anthropic
+subscription requests carry a Claude Code billing header and the client's
+`user-agent`, mirroring the recipe of
+[pi-anthropic-auth](https://github.com/gotgenes/pi-anthropic-auth), so Anthropic
+bills them as the client's Claude Code instead of rejecting them as
+out-of-extra-usage third-party traffic; `providers.anthropic.claude_code_version`
+overrides the reported version. OpenAI subscription
 mode does not enforce `max_tokens` and rejects temperature/top-p. Monitor availability
 remains unverified.
 

@@ -140,6 +140,12 @@ pub(crate) fn prepare(
     })
 }
 
+impl ForwardRequest {
+    pub(crate) fn payload_mut(&mut self) -> &mut Value {
+        &mut self.value
+    }
+}
+
 pub(crate) async fn send(
     client: &Client,
     request: &ForwardRequest,

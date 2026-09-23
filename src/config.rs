@@ -1,5 +1,8 @@
 pub use crate::models::config::{Config, ProviderConfig, Server};
-use crate::providers::{anthropic::models::AnthropicAuth, openai::models::OpenAiAuth};
+use crate::providers::{
+    anthropic::{billing, models::AnthropicAuth},
+    openai::models::OpenAiAuth,
+};
 use eyre::{Result, WrapErr, bail};
 use std::path::{Component, Path, PathBuf};
 
@@ -93,6 +96,13 @@ impl Config {
             match provider {
                 ProviderConfig::Anthropic(c) => {
                     validate_user_agent(c.user_agent.as_deref())?;
+                    if let Some(version) = c.claude_code_version.as_deref()
+                        && !billing::is_bare_version(version)
+                    {
+                        bail!(
+                            "providers.anthropic.claude_code_version must be a bare X.Y.Z version"
+                        );
+                    }
                     let local = validate_url(
                         c.base_url
                             .as_deref()
