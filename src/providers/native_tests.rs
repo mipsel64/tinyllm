@@ -1090,14 +1090,33 @@ async fn anthropic_subscription_sends_bearer_beta_and_retries_only_one_401() {
         "max_tokens":32,
         "messages":[{"role":"user","content":"hello"}]
     });
-    provider
+    let mut subscriber_context = context("claude-sonnet-4-6");
+    subscriber_context.headers.insert(
+        "user-agent",
+        "claude-cli/2.1.300 (external, cli)".parse().unwrap(),
+    );
+    let returned = provider
         .execute(
             ApiRequest::parse(ApiFormat::Anthropic, request.clone()).unwrap(),
-            context("claude-sonnet-4-6"),
+            subscriber_context,
         )
         .await
         .unwrap();
-    for _ in 0..2 {
+    // The client's Claude Code identity reaches Anthropic: its user-agent is
+    // forwarded and the billing header keys on that version.
+    let headers = receiver.recv().await.unwrap();
+    assert_eq!(headers["user-agent"], "claude-cli/2.1.300 (external, cli)");
+    let ResponseBody::Json(returned) = returned.body else {
+        panic!("expected JSON")
+    };
+    assert_eq!(
+        returned["system"],
+        json!([{
+            "type": "text",
+            "text": "x-anthropic-billing-header: cc_version=2.1.300.2d3; cc_entrypoint=sdk-cli; cch=2cf24;"
+        }])
+    );
+    {
         let headers = receiver.recv().await.unwrap();
         assert!(!headers.contains_key("x-api-key"));
         assert_eq!(headers["anthropic-version"], "2023-06-01");

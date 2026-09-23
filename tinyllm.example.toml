@@ -197,6 +197,9 @@ reasoning_effort = "medium"
 # [providers.anthropic]
 # type = "anthropic"
 # base_url = "https://api.anthropic.com/v1" # Default; /messages is appended.
+# claude_code_version = "2.1.280" # Optional. Subscription requests report a
+# Claude Code version in their billing header; the client's claude-cli
+# user-agent version wins when present, and this floors it for other clients.
 # [providers.anthropic.auth]
 # type = "Subscription"
 # options = { credentials_dir = "private-anthropic-auth" } # Optional.
