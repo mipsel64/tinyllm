@@ -1381,3 +1381,80 @@ fn anthropic_credentials_reject_existing_symlink_ancestor_alias() {
     assert!(!real_auth.exists());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn anthropic_subscription_catalog_retries_one_401_and_rejects_bad_json() {
+    use axum::response::IntoResponse;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/v1/oauth/token",
+            post(|| async {
+                Json(json!({"access_token":"access-new","refresh_token":"refresh-new","expires_in":3600}))
+            }),
+        )
+        .route(
+            "/v1/models",
+            axum::routing::get({
+                let calls = calls.clone();
+                move |uri: Uri, headers: HeaderMap| {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert_eq!(uri.query(), Some("limit=1000"));
+                        assert_eq!(headers["anthropic-beta"], "oauth-2025-04-20");
+                        assert_eq!(headers["anthropic-version"], "2023-06-01");
+                        match call {
+                            0 => {
+                                assert_eq!(headers["authorization"], "Bearer access-old");
+                                (StatusCode::UNAUTHORIZED, "{}").into_response()
+                            }
+                            1 => {
+                                assert_eq!(headers["authorization"], "Bearer access-new");
+                                Json(json!({"data":[{"id":"claude-opus-5","display_name":"Claude Opus 5"}]}))
+                                    .into_response()
+                            }
+                            _ => "not json".into_response(),
+                        }
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let directory = std::env::temp_dir().join(format!(
+        "tinyllm-anthropic-catalog-{}",
+        uuid::Uuid::new_v4()
+    ));
+    anthropic::auth::save_fixture(
+        &directory,
+        "access-old",
+        "refresh-old",
+        anthropic::auth::fixture_expiry(),
+    );
+    let server = Server::default();
+    let mut provider = anthropic::AnthropicProvider::new(
+        serde_json::from_value(json!({
+            "auth": {"type":"Subscription", "options":{"credentials_dir":directory.clone()}},
+            "base_url": format!("{base}/v1"),
+        }))
+        .unwrap(),
+        http::client(&server).unwrap(),
+        server,
+    )
+    .unwrap();
+    provider.set_token_url(format!("{base}/v1/oauth/token"));
+    let models = provider.upstream_models().await.unwrap();
+    assert_eq!(
+        models
+            .iter()
+            .map(|m| (m.id.as_str(), m.display_name.as_str()))
+            .collect::<Vec<_>>(),
+        [("claude-opus-5", "Claude Opus 5")]
+    );
+    let error = provider.upstream_models().await.err().unwrap();
+    assert_eq!(error.message, "invalid upstream catalog JSON");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    task.abort();
+    let _ = std::fs::remove_dir_all(directory);
+}

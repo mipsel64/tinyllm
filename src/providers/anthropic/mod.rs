@@ -20,6 +20,7 @@ pub struct AnthropicProvider {
     auth: Auth,
     client: Client,
     messages: Url,
+    catalog: Url,
     limit: usize,
 }
 
@@ -32,11 +33,30 @@ impl AnthropicProvider {
         let auth = Auth::open(&config.auth)?;
         Ok(Self {
             messages: http::endpoint(base, "/messages")?,
+            catalog: http::endpoint(base, "/models?limit=1000")?,
             auth,
             config,
             client,
             limit: server.max_response_bytes,
         })
+    }
+
+    fn catalog_request(&self, key: &str) -> Result<reqwest::RequestBuilder> {
+        let request = self
+            .client
+            .get(self.catalog.clone())
+            .header("anthropic-version", "2023-06-01");
+        let mut request = if self.auth.is_subscription() {
+            HttpAuth::Bearer(key)
+                .apply(request)?
+                .header("anthropic-beta", "oauth-2025-04-20")
+        } else {
+            HttpAuth::ApiKey(key).apply(request)?
+        };
+        if let Some(user_agent) = &self.config.user_agent {
+            request = request.header(reqwest::header::USER_AGENT, user_agent);
+        }
+        Ok(request)
     }
 
     #[cfg(test)]
@@ -56,6 +76,27 @@ impl Provider for AnthropicProvider {
                 display_name: id.clone(),
             })
             .collect()
+    }
+
+    async fn upstream_models(&self) -> Result<Vec<ModelInfo>> {
+        let mut key = self
+            .auth
+            .access(None)
+            .await
+            .map_err(|error| Error::upstream(error.to_string()))?;
+        let mut response = http::list(self.catalog_request(&key)?).await?;
+        if self.auth.is_subscription() && response.status() == StatusCode::UNAUTHORIZED {
+            drop(response);
+            key = self
+                .auth
+                .access(Some(&key))
+                .await
+                .map_err(|error| Error::upstream(error.to_string()))?;
+            response = http::list(self.catalog_request(&key)?).await?;
+        }
+        Ok(http::listed(
+            &http::catalog(response, &key, self.limit).await?,
+        ))
     }
 
     fn convert_reasoning_effort(&self, _model: &str, _effort: &str) -> Result<String> {

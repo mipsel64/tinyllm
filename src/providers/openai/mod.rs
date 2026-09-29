@@ -25,6 +25,10 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use futures::StreamExt;
 use serde_json::Value;
 
+/// Codex hides models newer than the caller's client version; tinyllm is not
+/// that client, so it asks for everything the account can use.
+const CODEX_CLIENT_VERSION: &str = "99.0.0";
+
 pub struct OpenAiProvider {
     config: Config,
     server: Server,
@@ -117,34 +121,10 @@ impl OpenAiProvider {
         key: &str,
         account: Option<&str>,
     ) -> Result<reqwest::Response> {
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
-            .map_err(|_| Error::upstream("invalid upstream access token"))?;
-        authorization.set_sensitive(true);
-        let mut request = self
-            .client
-            .post(format!(
-                "{}/responses",
-                self.config.base_url().trim_end_matches('/')
-            ))
-            .header("authorization", authorization)
-            .json(body);
-        if let Some(user_agent) = &self.config.user_agent {
-            request = request.header(reqwest::header::USER_AGENT, user_agent);
-        }
-        if let Some(org) = &self.config.organization {
-            request = request.header("openai-organization", org);
-        }
-        if let Some(project) = &self.config.project {
-            request = request.header("openai-project", project);
-        }
-        if let Some(account) = account {
-            let mut account = HeaderValue::from_str(account)
-                .map_err(|_| Error::upstream("invalid ChatGPT account ID"))?;
-            account.set_sensitive(true);
-            request = request
-                .header("chatgpt-account-id", account)
-                .header("originator", "tinyllm")
-                .header("accept", "text/event-stream");
+        let url = format!("{}/responses", self.config.base_url().trim_end_matches('/'));
+        let mut request = self.authorize(self.client.post(url).json(body), key, account)?;
+        if account.is_some() {
+            request = request.header("accept", "text/event-stream");
             // The Codex backend routes on this hint, which it sends beside the body tier.
             if body["service_tier"] == "priority"
                 && let Some(model) = body["model"].as_str()
@@ -163,6 +143,67 @@ impl OpenAiProvider {
                 "cannot connect to OpenAI"
             })
         })
+    }
+
+    fn authorize(
+        &self,
+        mut request: reqwest::RequestBuilder,
+        key: &str,
+        account: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder> {
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
+            .map_err(|_| Error::upstream("invalid upstream access token"))?;
+        authorization.set_sensitive(true);
+        request = request.header("authorization", authorization);
+        if let Some(user_agent) = &self.config.user_agent {
+            request = request.header(reqwest::header::USER_AGENT, user_agent);
+        }
+        if let Some(org) = &self.config.organization {
+            request = request.header("openai-organization", org);
+        }
+        if let Some(project) = &self.config.project {
+            request = request.header("openai-project", project);
+        }
+        if let Some(account) = account {
+            let mut account = HeaderValue::from_str(account)
+                .map_err(|_| Error::upstream("invalid ChatGPT account ID"))?;
+            account.set_sensitive(true);
+            request = request
+                .header("chatgpt-account-id", account)
+                .header("originator", "tinyllm");
+        }
+        Ok(request)
+    }
+
+    /// Lists what the Codex picker shows, plus the `-fast` names of models
+    /// that offer the fast tier.
+    fn codex_models(&self, value: &Value) -> Vec<ModelInfo> {
+        value["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|model| model["visibility"] == "list")
+            .filter_map(|model| {
+                let id = model["slug"].as_str()?;
+                let name = model["display_name"].as_str().unwrap_or(id);
+                let fast = format!("{id}-fast");
+                let has_fast = model["additional_speed_tiers"]
+                    .as_array()
+                    .is_some_and(|tiers| tiers.iter().any(|tier| tier == "fast"))
+                    && self.synthetic_fast_base(&fast).is_some();
+                Some(
+                    std::iter::once(ModelInfo {
+                        id: id.into(),
+                        display_name: name.into(),
+                    })
+                    .chain(has_fast.then(|| ModelInfo {
+                        id: fast,
+                        display_name: format!("{name} Fast"),
+                    })),
+                )
+            })
+            .flatten()
+            .collect()
     }
 
     async fn anthropic(&self, req: Value, context: RequestContext) -> Result<ProviderOutput> {
@@ -355,6 +396,40 @@ impl Provider for OpenAiProvider {
                 id,
             })
             .collect()
+    }
+
+    async fn upstream_models(&self) -> Result<Vec<ModelInfo>> {
+        let base = self.config.base_url().trim_end_matches('/');
+        let subscription = self.config.auth.is_subscription();
+        let url = if subscription {
+            format!("{base}/models?client_version={CODEX_CLIENT_VERSION}")
+        } else {
+            format!("{base}/models")
+        };
+        let (mut key, mut account) = self
+            .auth
+            .access(None)
+            .await
+            .map_err(|e| Error::upstream(e.to_string()))?;
+        let mut response =
+            http::list(self.authorize(self.client.get(&url), &key, account.as_deref())?).await?;
+        if subscription && response.status() == StatusCode::UNAUTHORIZED {
+            drop(response);
+            (key, account) = self
+                .auth
+                .access(Some(&key))
+                .await
+                .map_err(|e| Error::upstream(e.to_string()))?;
+            response =
+                http::list(self.authorize(self.client.get(&url), &key, account.as_deref())?)
+                    .await?;
+        }
+        let value = http::catalog(response, &key, self.server.max_response_bytes).await?;
+        Ok(if subscription {
+            self.codex_models(&value)
+        } else {
+            http::listed(&value)
+        })
     }
 
     async fn execute(

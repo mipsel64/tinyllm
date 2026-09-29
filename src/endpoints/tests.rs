@@ -111,6 +111,9 @@ async fn endpoint_formats_share_native_provider_routing_and_local_auth() {
         let request:Value=serde_json::from_slice(&body).unwrap();
         assert_eq!(request["model"],"deepseek/deepseek-4-pro");
         Json(json!({"id":"fixture","model":request["model"],"status":"completed","output":[],"choices":[],"content":[]}))
+    })).route("/models",axum::routing::get(|request:Request|async move {
+        assert_eq!(request.headers()["authorization"],"Bearer upstream-key");
+        Json(json!({"data":[{"id":"deepseek/deepseek-4-pro","name":"DeepSeek"},{"id":"other/model"},{"id":"bad//id"}]}))
     }))).await;
     let config = Config {
         server: Server {
@@ -124,7 +127,7 @@ async fn endpoint_formats_share_native_provider_routing_and_local_auth() {
                 ProviderConfig::OpenRouter(openrouter::models::Config {
                     api_key: "upstream-key".into(),
                     user_agent: None,
-                    base_url: Some(upstream),
+                    base_url: Some(upstream.clone()),
                     models: [(
                         "deepseek/deepseek-4-pro".into(),
                         openrouter::models::Model::default(),
@@ -137,7 +140,8 @@ async fn endpoint_formats_share_native_provider_routing_and_local_auth() {
                 ProviderConfig::Zai(zai::models::Config {
                     api_key: "fixture-key".into(),
                     user_agent: None,
-                    base_url: None,
+                    // Its catalog request fails here, so it lists no models.
+                    base_url: Some(upstream.clone()),
                     models: Default::default(),
                 }),
             ),
@@ -201,9 +205,18 @@ async fn endpoint_formats_share_native_provider_routing_and_local_auth() {
             .json::<Value>()
             .await
             .unwrap();
+        let ids: Vec<_> = response["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
         assert_eq!(
-            response["data"][0]["id"],
-            "openrouter/deepseek/deepseek-4-pro"
+            ids,
+            [
+                "openrouter/deepseek/deepseek-4-pro",
+                "openrouter/other/model"
+            ]
         );
         assert!(response.get("providers").is_none());
         if path == "/v1/models" {

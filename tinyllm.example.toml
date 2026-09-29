@@ -126,13 +126,13 @@ type = "Subscription"
 # type = "ApiKey"
 # options = "${OPENAI_API_KEY:-}"
 
-# Model tables are optional: they populate discovery and set request defaults,
-# not an allowlist. Unlisted native IDs are forwarded too. Quote IDs containing
+# Model tables are optional: discovery lists the upstream catalog, and tables set
+# request defaults. They are not an allowlist. Unlisted native IDs are forwarded too. Quote IDs containing
 # dots or slashes. Model availability depends on the upstream account.
 # Clients select the main/small/subagent model; there are no configurable aliases.
 # Any native ID beginning with gpt- also accepts a generated -fast name that sends
 # the base model with priority, configured or not; discovery lists it for configured
-# IDs only. Exact configured names stay literal, so listing an upstream ID that itself
+# IDs and for subscription models that offer the fast tier. Exact configured names stay literal, so listing an upstream ID that itself
 # ends in -fast keeps it verbatim; the suffix never stacks.
 [providers.openai.models."gpt-5.6-sol"]
 # Optional fallback when the client omits effort. Client reasoning controls win.
@@ -207,6 +207,6 @@ reasoning_effort = "medium"
 # For an API key, replace the two lines above with:
 # type = "ApiKey"
 # options = "${ANTHROPIC_API_KEY:-}"
-# Model entries are discovery only and take no options: reasoning and output
-# format travel with the request, so there is nothing to default or cap here.
+# Discovery lists the upstream catalog. Model entries take no options: reasoning
+# and output format travel with the request, so there is nothing to default or cap.
 # [providers.anthropic.models."claude-sonnet-4-6"]

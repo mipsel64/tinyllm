@@ -8,7 +8,10 @@ use crate::{
     error::Error,
     models::ModelInfo,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 pub struct Registry {
     providers: BTreeMap<String, Arc<dyn Provider>>,
@@ -58,15 +61,28 @@ impl Registry {
         Ok((provider.clone(), model.to_owned()))
     }
 
-    pub fn models(&self) -> Vec<ModelInfo> {
-        self.providers
-            .iter()
-            .flat_map(|(prefix, provider)| {
-                provider.models().into_iter().map(move |m| ModelInfo {
+    // FIXME: queries every upstream per call; cache if discovery traffic grows.
+    pub async fn models(&self) -> Vec<ModelInfo> {
+        let lists = self.providers.iter().map(|(prefix, provider)| async move {
+            let mut models = provider.upstream_models().await.unwrap_or_else(|error| {
+                tracing::warn!(provider = %prefix, error = %error, "cannot list upstream models");
+                Vec::new()
+            });
+            models.extend(provider.models());
+            let mut seen = HashSet::new();
+            models
+                .into_iter()
+                .filter(|m| validate_model(&m.id).is_ok() && seen.insert(m.id.clone()))
+                .map(|m| ModelInfo {
                     id: format!("{prefix}/{}", m.id),
                     display_name: m.display_name,
                 })
-            })
+                .collect::<Vec<_>>()
+        });
+        futures::future::join_all(lists)
+            .await
+            .into_iter()
+            .flatten()
             .collect()
     }
 }
