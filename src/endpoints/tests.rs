@@ -233,8 +233,8 @@ async fn endpoint_formats_share_native_provider_routing_and_local_auth() {
         .await
         .unwrap();
     assert_eq!(
-        response["configured_models"][0]["id"],
-        "openrouter/deepseek/deepseek-4-pro"
+        response["configured_models"],
+        json!([{"id":"openrouter/deepseek/deepseek-4-pro","object":"model","created":0,"owned_by":"openrouter"}])
     );
     assert!(response.get("data").is_none());
     assert_eq!(response["object"], "list");

@@ -61,6 +61,18 @@ impl Registry {
         Ok((provider.clone(), model.to_owned()))
     }
 
+    pub fn configured_models(&self) -> Vec<ModelInfo> {
+        self.providers
+            .iter()
+            .flat_map(|(prefix, provider)| {
+                provider.models().into_iter().map(move |m| ModelInfo {
+                    id: format!("{prefix}/{}", m.id),
+                    display_name: m.display_name,
+                })
+            })
+            .collect()
+    }
+
     // FIXME: queries every upstream per call; cache if discovery traffic grows.
     pub async fn models(&self) -> Vec<ModelInfo> {
         let lists = self.providers.iter().map(|(prefix, provider)| async move {
