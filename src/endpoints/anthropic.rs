@@ -70,6 +70,7 @@ async fn models(State(app): State<Arc<AppState>>) -> Json<ModelsListResponse> {
     let data: Vec<_> = app
         .providers
         .models()
+        .await
         .into_iter()
         .map(|m| ModelInfo {
             id: m.id,

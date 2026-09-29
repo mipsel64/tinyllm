@@ -17,6 +17,7 @@ pub struct ZaiProvider {
     messages: Url,
     chat: Url,
     responses: Url,
+    catalog: Url,
     limit: usize,
 }
 
@@ -27,6 +28,7 @@ impl ZaiProvider {
             messages: http::endpoint(base, "/anthropic/v1/messages")?,
             chat: http::endpoint(base, "/coding/paas/v4/chat/completions")?,
             responses: http::endpoint(base, "/v1/responses")?,
+            catalog: http::endpoint(base, "/coding/paas/v4/models")?,
             config,
             client,
             limit: server.max_response_bytes,
@@ -45,6 +47,18 @@ impl Provider for ZaiProvider {
                 display_name: id.clone(),
             })
             .collect()
+    }
+
+    async fn upstream_models(&self) -> Result<Vec<ModelInfo>> {
+        let key = &self.config.api_key;
+        let mut request = Auth::Bearer(key).apply(self.client.get(self.catalog.clone()))?;
+        if let Some(user_agent) = &self.config.user_agent {
+            request = request.header(reqwest::header::USER_AGENT, user_agent);
+        }
+        let response = http::list(request).await?;
+        Ok(http::listed(
+            &http::catalog(response, key, self.limit).await?,
+        ))
     }
 
     fn convert_reasoning_effort(&self, model: &str, effort: &str) -> Result<String> {

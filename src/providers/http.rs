@@ -2,14 +2,16 @@ use crate::{
     Result,
     config::Server,
     error::Error,
-    models::{ApiEvent, ApiFormat, ApiRequest, ProviderOutput, RequestContext, ResponseBody},
+    models::{
+        ApiEvent, ApiFormat, ApiRequest, ModelInfo, ProviderOutput, RequestContext, ResponseBody,
+    },
     providers::openai::reasoning,
 };
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt, stream::BoxStream};
-use reqwest::{Client, Response, Url};
+use reqwest::{Client, RequestBuilder, Response, Url};
 use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};
 
@@ -102,6 +104,56 @@ impl<'a> Auth<'a> {
             Self::Bearer(key) | Self::ApiKey(key) => key,
         }
     }
+
+    pub(crate) fn apply(self, builder: RequestBuilder) -> Result<RequestBuilder> {
+        Ok(match self {
+            Self::Bearer(key) => builder.bearer_auth(key),
+            Self::ApiKey(key) => {
+                let mut header = reqwest::header::HeaderValue::from_str(key)
+                    .map_err(|_| Error::upstream("provider api key is not a valid header value"))?;
+                header.set_sensitive(true);
+                builder.header("x-api-key", header)
+            }
+        })
+    }
+}
+
+/// Pi gives up on discovery after five seconds; answer with configured models first.
+const LIST_TIMEOUT: Duration = Duration::from_secs(4);
+
+pub(crate) async fn list(builder: RequestBuilder) -> Result<Response> {
+    builder
+        .timeout(LIST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|_| Error::upstream("cannot list upstream models"))
+}
+
+pub(crate) async fn catalog(response: Response, key: &str, limit: usize) -> Result<Value> {
+    let status = response.status();
+    let bytes = read_bounded(response, limit).await?;
+    if !status.is_success() {
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        return Err(upstream_error(status, &value, key));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| Error::upstream("invalid upstream catalog JSON"))
+}
+
+/// Reads the `data` list shared by OpenAI, Anthropic, OpenRouter and Z.ai.
+pub(crate) fn listed(value: &Value) -> Vec<ModelInfo> {
+    value["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model["id"].as_str()?;
+            let name = model["display_name"].as_str().or(model["name"].as_str());
+            Some(ModelInfo {
+                id: id.into(),
+                display_name: name.unwrap_or(id).into(),
+            })
+        })
+        .collect()
 }
 
 pub(crate) struct ForwardRequest {
@@ -152,16 +204,7 @@ pub(crate) async fn send(
     auth: Auth<'_>,
     extra_anthropic_beta: Option<&str>,
 ) -> Result<Response> {
-    let mut builder = client.post(request.url.clone()).json(&request.value);
-    builder = match auth {
-        Auth::Bearer(key) => builder.bearer_auth(key),
-        Auth::ApiKey(key) => {
-            let mut header = reqwest::header::HeaderValue::from_str(key)
-                .map_err(|_| Error::upstream("provider api key is not a valid header value"))?;
-            header.set_sensitive(true);
-            builder.header("x-api-key", header)
-        }
-    };
+    let mut builder = auth.apply(client.post(request.url.clone()).json(&request.value))?;
     if let Some(user_agent) = &request.user_agent {
         builder = builder.header(reqwest::header::USER_AGENT, user_agent);
     }

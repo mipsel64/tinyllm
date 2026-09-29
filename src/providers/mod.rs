@@ -18,7 +18,9 @@ use serde::{Deserialize, de::IntoDeserializer};
 
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
+    /// Configured models, listed even when the upstream catalog omits them.
     fn models(&self) -> Vec<ModelInfo>;
+    async fn upstream_models(&self) -> Result<Vec<ModelInfo>>;
     fn convert_reasoning_effort(&self, model: &str, effort: &str) -> Result<String>;
     async fn execute(&self, request: ApiRequest, context: RequestContext)
     -> Result<ProviderOutput>;

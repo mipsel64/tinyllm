@@ -347,6 +347,26 @@ fn fast_suffix_resolves_gpt_models() {
             "o4-mini"
         ]
     );
+    let catalog = json!({"models": [
+        {"slug": "gpt-6-sol", "display_name": "GPT-6-Sol", "visibility": "list", "additional_speed_tiers": ["fast"]},
+        {"slug": "gpt-5.4", "visibility": "list", "additional_speed_tiers": ["fast"]},
+        {"slug": "gpt-5.5", "visibility": "list"},
+        {"slug": "codex-auto-review", "visibility": "hide", "additional_speed_tiers": ["fast"]},
+    ]});
+    assert_eq!(
+        provider
+            .codex_models(&catalog)
+            .into_iter()
+            .map(|model| (model.id, model.display_name))
+            .collect::<Vec<_>>(),
+        [
+            ("gpt-6-sol", "GPT-6-Sol"),
+            ("gpt-6-sol-fast", "GPT-6-Sol Fast"),
+            ("gpt-5.4", "gpt-5.4"),
+            ("gpt-5.5", "gpt-5.5"),
+        ]
+        .map(|(id, name)| (id.to_owned(), name.to_owned()))
+    );
     assert!(
         provider
             .convert_reasoning_effort("gpt-6-astra-fast", "none")

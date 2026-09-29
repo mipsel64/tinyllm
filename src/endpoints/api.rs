@@ -14,7 +14,7 @@ impl Endpoint for ApiEndpoint {
 async fn models(State(app): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "object": "list",
-        "configured_models": app.providers.models().iter().map(|model| json!({
+        "configured_models": app.providers.configured_models().iter().map(|model| json!({
             "id": model.id,
             "object": "model",
             "created": 0,

@@ -25,12 +25,13 @@ async fn responses(State(app): State<Arc<AppState>>, request: Request) -> Respon
     endpoint::execute(app, request, ApiFormat::Responses).await
 }
 async fn models(State(app): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({"object": "list", "data": model_data(&app)}))
+    Json(json!({"object": "list", "data": model_data(&app).await}))
 }
 
-fn model_data(app: &AppState) -> Vec<Value> {
+async fn model_data(app: &AppState) -> Vec<Value> {
     app.providers
         .models()
+        .await
         .iter()
         .map(|m| {
             json!({
