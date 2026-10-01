@@ -100,6 +100,14 @@ impl Block {
         Ok(())
     }
     fn finish(&mut self, expected: &str) -> Result<()> {
+        if !self.done
+            && matches!(self.start, ContentBlockStart::ToolUse { .. })
+            && let Some(suffix) = expected.strip_prefix(&self.text)
+            && !suffix.is_empty()
+        {
+            // Done snapshots may carry tool arguments omitted from deltas.
+            self.append(suffix)?;
+        }
         if self.text != expected {
             return Err(Error::upstream(
                 "completed content differs from streamed deltas",
@@ -113,8 +121,7 @@ impl Block {
             }
             // Arguments are buffered until here, so a repair still reaches the
             // client as the only version of the call it ever sees. `text` stays
-            // as streamed: upstream repeats these arguments on item completion
-            // and they must still match.
+            // as completed upstream: repeated snapshots must still match.
             if !self.done
                 && let Some(repaired) = super::tool_args::sanitize(name, expected)
             {
