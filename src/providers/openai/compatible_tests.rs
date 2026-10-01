@@ -221,6 +221,247 @@ fn chat_portable_history_rejects_invalid_tool_pairing() {
     );
 }
 
+fn tool_completion_fixture(
+    initial: &str,
+    delta: &str,
+    field_done: bool,
+    name: &str,
+    arguments: &str,
+) -> Vec<Value> {
+    let item = json!({"id":"fc_1","type":"function_call","call_id":"call_a","name":name,"arguments":arguments});
+    let mut start = item.clone();
+    start["arguments"] = json!(initial);
+    let mut events = vec![
+        json!({"type":"response.created","response":{"id":"resp_1","created_at":123}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":start}),
+    ];
+    if !delta.is_empty() {
+        events.push(json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":delta}));
+    }
+    if field_done {
+        let done = json!({"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","arguments":item["arguments"]});
+        events.extend([done.clone(), done]);
+    }
+    events.extend([
+        json!({"type":"response.output_item.done","output_index":0,"item":item}),
+        json!({"type":"response.completed","response":completed(json!([item]))}),
+    ]);
+    for (sequence, event) in events.iter_mut().enumerate() {
+        event["sequence_number"] = json!(sequence);
+    }
+    events
+}
+
+#[test]
+fn tool_completion_snapshots_fill_only_missing_suffixes_across_stream_adapters() {
+    for field_done in [false, true] {
+        for (initial, delta) in [
+            ("", ""),
+            ("", "{\"path\":\"é"),
+            ("{\"path\":", "\"é"),
+            ("{\"path\":\"é.txt\"}", ""),
+            ("", "{\"path\":\"é.txt\"}"),
+        ] {
+            for sparse in [false, true] {
+                let mut events = tool_completion_fixture(
+                    initial,
+                    delta,
+                    field_done,
+                    "lookup",
+                    "{\"path\":\"é.txt\"}",
+                );
+                let expected = events.last().unwrap()["response"].clone();
+                if sparse {
+                    events.last_mut().unwrap()["response"]["output"] = json!([]);
+                }
+                let mut native = stream::Native::new(sparse);
+                let mut chat = stream::Chat::new("openai/gpt-native".into());
+                let mut anthropic =
+                    super::super::stream::Translator::new("openai/gpt-native".into());
+                anthropic.sparse_completion = sparse;
+                let mut chat_arguments = String::new();
+                let mut anthropic_arguments = String::new();
+                for event in events {
+                    let accepted = native.accept(event.clone()).unwrap();
+                    let mut expected_event = event.clone();
+                    if sparse && event["type"] == "response.completed" {
+                        expected_event["response"]["output"] = expected["output"].clone();
+                    }
+                    assert_eq!(accepted, expected_event);
+                    for chunk in chat.accept(&accepted).unwrap() {
+                        if let Some(arguments) =
+                            chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                                .as_str()
+                        {
+                            chat_arguments.push_str(arguments);
+                        }
+                    }
+                    for output in anthropic.accept(&event).unwrap() {
+                        if let Some(arguments) = json!(output)["delta"]["partial_json"].as_str() {
+                            anthropic_arguments.push_str(arguments);
+                        }
+                    }
+                }
+                let final_native = native.finish().unwrap();
+                assert_eq!(final_native["output"], expected["output"]);
+                assert_eq!(anthropic.completed.unwrap()["output"], expected["output"]);
+                assert_eq!(
+                    chat_arguments,
+                    expected["output"][0]["arguments"].as_str().unwrap()
+                );
+                assert_eq!(anthropic_arguments, chat_arguments);
+                // Buffered compatible callers consume this same validated terminal response.
+                assert_eq!(
+                    chat_response(&final_native, "openai/gpt-native").unwrap()["choices"][0]["message"]
+                        ["tool_calls"][0]["function"]["arguments"],
+                    chat_arguments
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn tool_completion_snapshots_reject_divergence_and_changes_after_finalization() {
+    for field_done in [false, true] {
+        // Divergence and truncation at either completion boundary must still fail.
+        for delta in ["{\"other\":", "{\"path\":\"é.txt\"}extra"] {
+            let events =
+                tool_completion_fixture("", delta, field_done, "lookup", "{\"path\":\"é.txt\"}");
+            let mut native = stream::Native::new(false);
+            let mut anthropic = super::super::stream::Translator::new("openai/gpt-native".into());
+            assert!(
+                events
+                    .iter()
+                    .try_for_each(|e| native.accept(e.clone()).map(|_| ()))
+                    .is_err()
+            );
+            assert!(
+                events
+                    .iter()
+                    .try_for_each(|e| anthropic.accept(e).map(|_| ()))
+                    .is_err()
+            );
+            assert!(!native.is_complete());
+            assert!(anthropic.completed.is_none());
+        }
+        for sparse in [false, true] {
+            for arguments in ["{\"path\":\"changed\"}", "{\"path\":\"é"] {
+                let mut events =
+                    tool_completion_fixture("", "", field_done, "lookup", "{\"path\":\"é.txt\"}");
+                let mut terminal = events.pop().unwrap();
+                terminal["response"]["output"][0]["arguments"] = json!(arguments);
+                let mut native = stream::Native::new(sparse);
+                let mut anthropic =
+                    super::super::stream::Translator::new("openai/gpt-native".into());
+                anthropic.sparse_completion = sparse;
+                for event in events {
+                    native.accept(event.clone()).unwrap();
+                    anthropic.accept(&event).unwrap();
+                }
+                assert_eq!(
+                    native.accept(terminal.clone()).unwrap_err().message,
+                    "terminal output differs from streamed items"
+                );
+                assert_eq!(
+                    anthropic.accept(&terminal).unwrap_err().message,
+                    "terminal output differs from streamed items"
+                );
+                assert!(!native.is_complete());
+                assert!(anthropic.completed.is_none());
+            }
+        }
+    }
+    let events = tool_completion_fixture("", "", true, "lookup", "{\"path\":\"é.txt\"}");
+    let first_done = events
+        .iter()
+        .position(|e| e["type"] == "response.function_call_arguments.done")
+        .unwrap();
+    let mut changed_item = events[events.len() - 2].clone();
+    changed_item["item"]["arguments"] = json!("{\"path\":\"é.txt\"} ");
+    for late in [
+        json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":" "}),
+        json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"é.txt\"} "}),
+        json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":"{}"}),
+        changed_item,
+    ] {
+        let mut native = stream::Native::new(false);
+        let mut anthropic = super::super::stream::Translator::new("openai/gpt-native".into());
+        for event in &events[..=first_done] {
+            native.accept(event.clone()).unwrap();
+            anthropic.accept(event).unwrap();
+        }
+        assert!(native.accept(late.clone()).is_err());
+        assert!(anthropic.accept(&late).is_err());
+    }
+}
+
+#[test]
+fn tool_completion_snapshots_reject_invalid_anthropic_argument_json() {
+    for field_done in [false, true] {
+        for (prefix, arguments) in [
+            ("{", "{invalid}"),
+            ("[", "[1]"),
+            ("\"", "\"value\""),
+            ("n", "null"),
+        ] {
+            for delta in ["", prefix] {
+                let events = tool_completion_fixture("", delta, field_done, "lookup", arguments);
+                let mut anthropic =
+                    super::super::stream::Translator::new("openai/gpt-native".into());
+                for event in events {
+                    if event["type"] == "response.function_call_arguments.done"
+                        || event["type"] == "response.output_item.done"
+                    {
+                        assert_eq!(
+                            anthropic.accept(&event).unwrap_err().message,
+                            "upstream returned invalid tool argument JSON"
+                        );
+                        assert!(anthropic.completed.is_none());
+                        break;
+                    }
+                    for emitted in anthropic.accept(&event).unwrap() {
+                        assert_ne!(json!(emitted)["type"], "content_block_delta");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tool_completion_snapshots_sanitize_anthropic_read_arguments_once() {
+    let arguments = r#"{"file_path":"/tmp/a","pages":""}"#;
+    for field_done in [false, true] {
+        for delta in ["", r#"{"file_path":"/tmp/a","pages":""#] {
+            let events = tool_completion_fixture("", delta, field_done, "Read", arguments);
+            let mut anthropic = super::super::stream::Translator::new("openai/gpt-native".into());
+            let mut emitted_arguments = Vec::new();
+            for event in events {
+                for emitted in anthropic.accept(&event).unwrap() {
+                    if let Some(arguments) = json!(emitted)["delta"]["partial_json"].as_str() {
+                        assert!(
+                            event["type"] == "response.function_call_arguments.done"
+                                || event["type"] == "response.output_item.done"
+                        );
+                        emitted_arguments.push(arguments.to_owned());
+                    }
+                }
+            }
+            assert_eq!(emitted_arguments, [r#"{"file_path":"/tmp/a"}"#]);
+            let response = super::super::protocol::response(
+                &anthropic.completed.unwrap(),
+                "openai/gpt-native",
+            )
+            .unwrap();
+            assert_eq!(
+                json!(response.content)[0]["input"],
+                json!({"file_path":"/tmp/a"})
+            );
+        }
+    }
+}
+
 #[test]
 fn native_sse_preserves_hosted_items_and_repairs_sparse_completion() {
     let mut tracker = stream::Native::new(true);
@@ -247,16 +488,22 @@ fn native_sse_preserves_hosted_items_and_repairs_sparse_completion() {
 
 #[test]
 fn chat_stream_keeps_fragmented_tool_arguments_separate() {
+    let mut native = stream::Native::new(false);
     let mut translator = stream::Chat::new("openai/gpt-native".into());
-    translator
-        .accept(&json!({"type":"response.created","response":{"id":"resp_1","created_at":123}}))
-        .unwrap();
+    let created = json!({"type":"response.created","response":{"id":"resp_1","created_at":123}});
+    translator.accept(&native.accept(created).unwrap()).unwrap();
     let mut chunks = Vec::new();
     for (index, id) in [(0, "call_a"), (1, "call_b")] {
-        chunks.extend(translator.accept(&json!({"type":"response.output_item.added","output_index":index,"item":{"id":format!("fc_{index}"),"type":"function_call","call_id":id,"name":"lookup","arguments":""}})).unwrap());
+        let event = json!({"type":"response.output_item.added","output_index":index,"item":{"id":format!("fc_{index}"),"type":"function_call","call_id":id,"name":"lookup","arguments":""}});
+        chunks.extend(translator.accept(&native.accept(event).unwrap()).unwrap());
     }
-    for (index, delta) in [(0, "{\"x\":"), (1, "{\"x\":2"), (0, "1}"), (1, "}")] {
-        chunks.extend(translator.accept(&json!({"type":"response.function_call_arguments.delta","output_index":index,"delta":delta})).unwrap());
+    for (index, delta) in [(0, "{\"x\":"), (1, "{\"x\":2"), (0, "1"), (1, "}")] {
+        let event = json!({"type":"response.function_call_arguments.delta","output_index":index,"delta":delta});
+        chunks.extend(translator.accept(&native.accept(event).unwrap()).unwrap());
+    }
+    for (index, arguments) in [(1, "{\"x\":2}"), (0, "{\"x\":1}")] {
+        let event = json!({"type":"response.function_call_arguments.done","output_index":index,"arguments":arguments});
+        chunks.extend(translator.accept(&native.accept(event).unwrap()).unwrap());
     }
     let arguments = |index| {
         chunks

@@ -6,6 +6,28 @@ struct Item {
     initial: Value,
     complete: Option<Value>,
     fragments: BTreeMap<(usize, String), String>,
+    arguments_done: bool,
+}
+
+impl Item {
+    fn finish_arguments(&mut self, expected: &str) -> Result<()> {
+        let arguments = self
+            .fragments
+            .get_mut(&(0, "arguments".into()))
+            .ok_or_else(|| Error::upstream("tool arguments before tool call start"))?;
+        // Some Responses backends supply the missing suffix only in a done snapshot.
+        if (!self.arguments_done && expected.starts_with(arguments.as_str()))
+            || expected == arguments
+        {
+            *arguments = expected.into();
+            self.arguments_done = true;
+            Ok(())
+        } else {
+            Err(Error::upstream(
+                "completed tool arguments differ from streamed deltas or prior completion",
+            ))
+        }
+    }
 }
 
 pub struct Native {
@@ -70,6 +92,7 @@ impl Native {
                     initial: item.clone(),
                     complete: None,
                     fragments,
+                    arguments_done: false,
                 });
             }
             "response.content_part.added" => {
@@ -97,6 +120,9 @@ impl Native {
                 let (part, key) = fragment(&event, &kind)?;
                 let delta = text(&event, "delta")?;
                 let item = self.item(&event)?;
+                if key == "arguments" && item.arguments_done {
+                    return Err(Error::upstream("delta after tool arguments completion"));
+                }
                 let value = item
                     .fragments
                     .get_mut(&(part, key.into()))
@@ -108,11 +134,10 @@ impl Native {
             | "response.function_call_arguments.done" => {
                 let (part, key) = fragment(&event, &kind)?;
                 let expected = text(&event, key)?;
-                if self
-                    .item(&event)?
-                    .fragments
-                    .get(&(part, key.into()))
-                    .map(String::as_str)
+                let item = self.item(&event)?;
+                if key == "arguments" {
+                    item.finish_arguments(expected)?;
+                } else if item.fragments.get(&(part, key.into())).map(String::as_str)
                     != Some(expected)
                 {
                     return Err(Error::upstream(
@@ -134,16 +159,7 @@ impl Native {
                     {
                         return Err(Error::upstream("completed tool identity changed"));
                     }
-                    if item
-                        .fragments
-                        .get(&(0, "arguments".into()))
-                        .map(String::as_str)
-                        != Some(text(final_item, "arguments")?)
-                    {
-                        return Err(Error::upstream(
-                            "completed tool arguments differ from streamed deltas",
-                        ));
-                    }
+                    item.finish_arguments(text(final_item, "arguments")?)?;
                 }
                 if final_item["type"] == "message" {
                     let parts = final_item["content"]
@@ -270,7 +286,8 @@ pub struct Chat {
     model: String,
     id: Option<String>,
     created: Value,
-    tools: BTreeMap<usize, usize>,
+    // Output index -> (Chat tool index, argument bytes already emitted).
+    tools: BTreeMap<usize, (usize, usize)>,
     calls: HashSet<String>,
 }
 
@@ -295,6 +312,7 @@ impl Chat {
         )
     }
 
+    // Production callers pass only events accepted by Native, including prefix validation.
     pub fn accept(&mut self, event: &Value) -> Result<Vec<Value>> {
         let delta = match text(event, "type")? {
             "response.created" => {
@@ -309,17 +327,47 @@ impl Chat {
                     return Err(Error::upstream("empty or duplicate tool call ID"));
                 }
                 let tool_index = self.tools.len();
-                self.tools.insert(index(event, "output_index")?, tool_index);
+                self.tools.insert(
+                    index(event, "output_index")?,
+                    (tool_index, text(item, "arguments")?.len()),
+                );
                 json!({"tool_calls":[{"index":tool_index,"id":id,"type":"function","function":{"name":text(item,"name")?,"arguments":text(item,"arguments")?}}]})
             }
             "response.function_call_arguments.delta" => {
-                let tool_index =
-                    self.tools
-                        .get(&index(event, "output_index")?)
-                        .ok_or_else(|| {
-                            Error::upstream("tool argument delta refers to an unknown call")
-                        })?;
-                json!({"tool_calls":[{"index":tool_index,"function":{"arguments":text(event,"delta")?}}]})
+                let (tool_index, emitted) = self
+                    .tools
+                    .get_mut(&index(event, "output_index")?)
+                    .ok_or_else(|| {
+                        Error::upstream("tool argument delta refers to an unknown call")
+                    })?;
+                let delta = text(event, "delta")?;
+                *emitted += delta.len();
+                json!({"tool_calls":[{"index":tool_index,"function":{"arguments":delta}}]})
+            }
+            "response.function_call_arguments.done" | "response.output_item.done"
+                if event["type"] == "response.function_call_arguments.done"
+                    || event["item"]["type"] == "function_call" =>
+            {
+                let (tool_index, emitted) = self
+                    .tools
+                    .get_mut(&index(event, "output_index")?)
+                    .ok_or_else(|| Error::upstream("tool completion refers to an unknown call"))?;
+                let arguments = text(
+                    if event["type"] == "response.output_item.done" {
+                        &event["item"]
+                    } else {
+                        event
+                    },
+                    "arguments",
+                )?;
+                let suffix = arguments
+                    .get(*emitted..)
+                    .ok_or_else(|| Error::upstream("invalid completed tool argument prefix"))?;
+                *emitted = arguments.len();
+                if suffix.is_empty() {
+                    return Ok(Vec::new());
+                }
+                json!({"tool_calls":[{"index":tool_index,"function":{"arguments":suffix}}]})
             }
             "response.content_part.added" => match event["part"]["type"].as_str() {
                 Some("output_text") => json!({"content":text(&event["part"],"text")?}),
