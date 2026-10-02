@@ -13,7 +13,11 @@ use axum::{
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::{Value, json};
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tracing::Instrument;
 
 pub trait Endpoint: Send + Sync {
@@ -137,6 +141,7 @@ async fn run(app: Arc<AppState>, request: Request, format: ApiFormat) -> crate::
         query,
     };
     tracing::debug!(request_id=%context.request_id,provider=%context.provider,model=%context.model,"dispatch request");
+    let started = Instant::now();
     let result = provider.execute(request, context).await?;
     let response = match result.body {
         ResponseBody::Json(value) => (result.headers, Json(value)).into_response(),
@@ -148,6 +153,7 @@ async fn run(app: Arc<AppState>, request: Request, format: ApiFormat) -> crate::
                 let mut keep_alive=tokio::time::interval(duration);
                 keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 keep_alive.tick().await;
+                let mut first_token_logged = false;
                 let mut sequence=0u64;
                 loop {
                     let item=tokio::select! {
@@ -159,6 +165,13 @@ async fn run(app: Arc<AppState>, request: Request, format: ApiFormat) -> crate::
                     };
                     match item {
                         Some(Ok(event))=> {
+                            if !first_token_logged && is_content_event(&event) {
+                                first_token_logged = true;
+                                span.in_scope(|| tracing::info!(
+                                    first_token_ms = started.elapsed().as_millis() as u64,
+                                    "first content event forwarded"
+                                ));
+                            }
                             if let ApiEvent::Responses(value)=&event { sequence=value["sequence_number"].as_u64().unwrap_or(sequence).saturating_add(1); }
                             yield Ok(serialize(event));
                         }
@@ -200,4 +213,22 @@ fn serialize(event: ApiEvent) -> Bytes {
         ApiEvent::ChatCompletions(value) => Bytes::from(format!("data: {value}\n\n")),
         ApiEvent::Done => Bytes::from_static(b"data: [DONE]\n\n"),
     }
+}
+
+/// True for events that carry generated content, false for stream bookkeeping
+/// (message_start, pings, usage trailers). Used only to timestamp the first
+/// visible token; false negatives just delay that log line.
+pub(crate) fn is_content_event(event: &ApiEvent) -> bool {
+    let value = match event {
+        ApiEvent::Anthropic(value) | ApiEvent::Responses(value) => value,
+        ApiEvent::ChatCompletions(value) => {
+            return value["choices"].as_array().is_some_and(|c| !c.is_empty());
+        }
+        ApiEvent::Done => return false,
+    };
+    let kind = value["type"].as_str().unwrap_or_default();
+    kind.starts_with("content_block")
+        || kind.starts_with("response.output")
+        || kind.starts_with("response.reasoning_summary")
+        || kind.starts_with("response.reasoning_text")
 }

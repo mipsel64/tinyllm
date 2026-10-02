@@ -248,3 +248,32 @@ async fn endpoint_formats_share_native_provider_routing_and_local_auth() {
     task.abort();
     up_task.abort();
 }
+
+#[test]
+fn content_event_classification_separates_bookkeeping_from_output() {
+    use crate::{endpoints::endpoint::is_content_event, models::ApiEvent};
+
+    let anthropic = |kind: &str| ApiEvent::Anthropic(json!({"type": kind}));
+    assert!(is_content_event(&anthropic("content_block_delta")));
+    assert!(is_content_event(&anthropic("content_block_start")));
+    assert!(!is_content_event(&anthropic("message_start")));
+    assert!(!is_content_event(&anthropic("ping")));
+    assert!(!is_content_event(&anthropic("message_delta")));
+
+    let responses = |kind: &str| ApiEvent::Responses(json!({"type": kind}));
+    assert!(is_content_event(&responses("response.output_text.delta")));
+    assert!(is_content_event(&responses("response.output_item.added")));
+    assert!(is_content_event(&responses(
+        "response.reasoning_summary.part.added"
+    )));
+    assert!(!is_content_event(&responses("response.created")));
+    assert!(!is_content_event(&responses("response.completed")));
+
+    assert!(is_content_event(&ApiEvent::ChatCompletions(
+        json!({"choices":[{"delta":{"content":"hi"}}]})
+    )));
+    assert!(!is_content_event(&ApiEvent::ChatCompletions(
+        json!({"choices":[]})
+    )));
+    assert!(!is_content_event(&ApiEvent::Done));
+}
