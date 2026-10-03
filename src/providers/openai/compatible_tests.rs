@@ -88,6 +88,82 @@ fn completed(output: Value) -> Value {
     json!({"id":"resp_1","object":"response","created_at":123,"status":"completed","output":output,"usage":{"input_tokens":10,"output_tokens":7,"total_tokens":17,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}})
 }
 
+fn unusable_chat_outputs() -> Vec<Value> {
+    vec![
+        json!([]),
+        json!([{"id":"rs_1","type":"reasoning","encrypted_content":"opaque","summary":[]}]),
+        json!([{"id":"msg_1","type":"message","role":"assistant","content":[]}]),
+        json!([{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":""}]}]),
+        json!([{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"refusal","refusal":""}]}]),
+        json!([{"id":"rs_1","type":"reasoning","encrypted_content":"opaque","summary":[]},{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":""},{"type":"refusal","refusal":""}]}]),
+    ]
+}
+
+fn text_output(text: &str) -> Value {
+    json!([{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}])
+}
+
+#[test]
+fn chat_response_rejects_completed_outputs_without_text_refusal_or_tools() {
+    for output in unusable_chat_outputs() {
+        let native = completed(output);
+        // Native Responses may return reasoning-only or empty completions unchanged.
+        validate_response(&native).unwrap();
+        let error = chat_response(&native, "openai/gpt-native").unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(error.kind, "api_error");
+        assert_eq!(
+            error.message,
+            "upstream completed without any text, refusal or tool call; nothing to return"
+        );
+    }
+}
+
+#[test]
+fn chat_response_preserves_text_refusal_and_tool_only_completions() {
+    for text in ["hello", " "] {
+        let response = chat_response(&completed(text_output(text)), "openai/gpt-native").unwrap();
+        assert_eq!(response["choices"][0]["message"]["content"], text);
+        assert_eq!(response["choices"][0]["finish_reason"], "stop");
+    }
+    let refusal = completed(
+        json!([{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"refusal","refusal":"declined"}]}]),
+    );
+    let response = chat_response(&refusal, "openai/gpt-native").unwrap();
+    assert_eq!(response["choices"][0]["message"]["content"], Value::Null);
+    assert_eq!(response["choices"][0]["message"]["refusal"], "declined");
+    assert_eq!(response["choices"][0]["finish_reason"], "stop");
+
+    let tool = completed(
+        json!([{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}]),
+    );
+    let response = chat_response(&tool, "openai/gpt-native").unwrap();
+    assert_eq!(response["choices"][0]["message"]["content"], Value::Null);
+    assert_eq!(
+        response["choices"][0]["message"]["tool_calls"][0]["id"],
+        "call_1"
+    );
+    assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+}
+
+#[test]
+fn chat_response_preserves_empty_incomplete_response_semantics() {
+    for output in unusable_chat_outputs() {
+        for (reason, finish) in [
+            ("max_output_tokens", "length"),
+            ("content_filter", "content_filter"),
+        ] {
+            let mut native = completed(output.clone());
+            native["status"] = json!("incomplete");
+            native["incomplete_details"] = json!({"reason":reason});
+            let response = chat_response(&native, "openai/gpt-native").unwrap();
+            assert_eq!(response["choices"][0]["message"]["content"], Value::Null);
+            assert_eq!(response["choices"][0]["message"]["refusal"], Value::Null);
+            assert_eq!(response["choices"][0]["finish_reason"], finish);
+        }
+    }
+}
+
 #[test]
 fn chat_carrier_roundtrip_replays_reasoning_and_two_tools() {
     let native = completed(
@@ -631,6 +707,8 @@ async fn subscription_json_and_sse_accept_missing_content_type_and_keep_reasonin
         json!({"type":"response.created","response":{"id":"resp_1","created_at":123,"model":"gpt-native"}}),
         json!({"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning","summary":[]}}),
         json!({"type":"response.output_item.done","output_index":0,"item":reasoning}),
+        json!({"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}}),
+        json!({"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}}),
         json!({"type":"response.completed","response":{"id":"resp_1","output":[],"usage":{"input_tokens":3,"output_tokens":2}}}),
     ];
     let raw: String = events
@@ -818,7 +896,7 @@ fn chat_nullable_defaults_keep_client_reasoning_and_nonstrict_tools() {
 
 #[test]
 fn chat_usage_rejects_impossible_cache_or_reasoning_details() {
-    let mut response = completed(json!([]));
+    let mut response = completed(text_output("hello"));
     response["usage"]["input_tokens_details"]["cached_tokens"] = json!(11);
     assert!(chat_response(&response, "codex/gpt-native").is_err());
     response["usage"]["input_tokens_details"]["cached_tokens"] = json!(0);
@@ -978,7 +1056,7 @@ async fn api_key_chat_json_and_fragmented_sse_roundtrip_two_tools() {
 
 #[test]
 fn chat_created_timestamp_is_an_integer_when_upstream_omits_it() {
-    let mut response = completed(json!([]));
+    let mut response = completed(text_output("hello"));
     assert_eq!(
         chat_response(&response, "codex/gpt-native").unwrap()["created"],
         123
@@ -993,4 +1071,305 @@ fn chat_created_timestamp_is_an_integer_when_upstream_omits_it() {
     );
     response["created_at"] = json!("bad timestamp");
     assert!(chat_response(&response, "codex/gpt-native").is_err());
+}
+
+/// Complete output items and content parts before the terminal snapshot, including
+/// the sparse snapshot used by subscription backends.
+fn completion_sse_fixture(response: &Value, sparse: bool) -> String {
+    let mut events =
+        vec![json!({"type":"response.created","response":{"id":response["id"],"created_at":123}})];
+    for (index, item) in response["output"].as_array().unwrap().iter().enumerate() {
+        events.push(json!({"type":"response.output_item.added","output_index":index,"item":item}));
+        if let Some(parts) = item["content"].as_array() {
+            for (part_index, part) in parts.iter().enumerate() {
+                events.push(json!({"type":"response.content_part.added","output_index":index,"content_index":part_index,"part":part}));
+            }
+        }
+        events.push(json!({"type":"response.output_item.done","output_index":index,"item":item}));
+    }
+    let mut terminal = response.clone();
+    if sparse {
+        terminal["output"] = json!([]);
+    }
+    events.push(json!({"type":format!("response.{}", response["status"].as_str().unwrap()),"response":terminal}));
+    events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect()
+}
+
+#[tokio::test]
+async fn chat_empty_completions_fail_across_auth_and_wire_formats_without_terminal_success() {
+    use super::super::models::{Config, OpenAiAuth, SubscriptionOptions};
+    use axum::{Json, Router, response::IntoResponse, routing::post};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let unusable = unusable_chat_outputs();
+    let unusable_count = unusable.len();
+    let mut fixtures: Vec<_> = unusable.into_iter().map(completed).collect();
+    fixtures.extend([
+        completed(text_output("hello")),
+        completed(json!([{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"refusal","refusal":"declined"}]}])),
+        completed(json!([{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}])),
+    ]);
+    for reason in ["max_output_tokens", "content_filter"] {
+        let mut incomplete = completed(json!([]));
+        incomplete["status"] = json!("incomplete");
+        incomplete["incomplete_details"] = json!({"reason":reason});
+        fixtures.push(incomplete);
+    }
+    let fixtures = Arc::new(fixtures);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/responses",
+        post({
+            let fixtures = fixtures.clone();
+            let requests = requests.clone();
+            move |headers: HeaderMap, Json(body): Json<Value>| {
+                let fixtures = fixtures.clone();
+                let requests = requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(headers["authorization"], "Bearer fixture-key");
+                    let label = body["input"]
+                        .as_str()
+                        .or_else(|| body["input"][0]["content"][0]["text"].as_str())
+                        .unwrap();
+                    let (index, wire) = label.split_once(':').unwrap();
+                    let response = &fixtures[index.parse::<usize>().unwrap()];
+                    if wire == "sse" {
+                        let sparse = headers.contains_key("chatgpt-account-id");
+                        (
+                            [("content-type", "text/event-stream")],
+                            completion_sse_fixture(response, sparse),
+                        )
+                            .into_response()
+                    } else {
+                        Json(response.clone()).into_response()
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let directory =
+        std::env::temp_dir().join(format!("tinyllm-empty-chat-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("openai.json");
+    std::fs::write(&path, json!({"access_token":"fixture-key","refresh_token":"fixture-refresh","account_id":"fixture-account","expires_at":u64::MAX}).to_string()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut expected_requests = 0;
+    for subscription in [false, true] {
+        let server = crate::config::Server::default();
+        let provider = OpenAiProvider::new(
+            Config {
+                base_url: base.clone(),
+                user_agent: None,
+                auth: if subscription {
+                    OpenAiAuth::Subscription(SubscriptionOptions {
+                        credentials_dir: directory.clone(),
+                    })
+                } else {
+                    OpenAiAuth::ApiKey("fixture-key".into())
+                },
+                organization: None,
+                project: None,
+                models: Default::default(),
+            },
+            http::client(&server).unwrap(),
+            server,
+        )
+        .unwrap();
+        for (index, fixture) in fixtures.iter().enumerate() {
+            for format in [ApiFormat::ChatCompletions, ApiFormat::Responses] {
+                for upstream_sse in [false, true] {
+                    if subscription && !upstream_sse {
+                        continue;
+                    }
+                    for streaming in [false, true] {
+                        if streaming && !upstream_sse {
+                            continue;
+                        }
+                        let label =
+                            format!("{index}:{}", if upstream_sse { "sse" } else { "json" });
+                        let mut body = json!({"model":"codex/gpt-native","stream":streaming});
+                        if format == ApiFormat::ChatCompletions {
+                            body["messages"] = json!([{"role":"user","content":label}]);
+                            body["stream_options"] = json!({"include_usage":true});
+                        } else {
+                            body["input"] = json!(label);
+                        }
+                        let reject = format == ApiFormat::ChatCompletions && index < unusable_count;
+                        let result = provider
+                            .execute(ApiRequest::parse(format, body).unwrap(), context())
+                            .await;
+                        expected_requests += 1;
+                        if reject && !streaming {
+                            let error = result
+                                .err()
+                                .expect("empty Chat must fail before returning JSON");
+                            assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+                            assert_eq!(
+                                error.message,
+                                "upstream completed without any text, refusal or tool call; nothing to return"
+                            );
+                            continue;
+                        }
+                        match result.unwrap().body {
+                            ResponseBody::Json(response) => {
+                                assert!(!streaming, "streaming request returned JSON");
+                                if format == ApiFormat::Responses {
+                                    assert_eq!(response["output"], fixture["output"]);
+                                    assert_eq!(response["status"], fixture["status"]);
+                                } else {
+                                    assert_eq!(
+                                        response,
+                                        chat_response(fixture, "codex/gpt-native").unwrap()
+                                    );
+                                }
+                            }
+                            ResponseBody::Stream(mut events) => {
+                                assert!(streaming, "nonstreaming request returned a stream");
+                                let mut message =
+                                    json!({"content":"","refusal":"","tool_calls":[]});
+                                let mut failed = false;
+                                let mut finished = false;
+                                let mut done = false;
+                                while let Some(event) = events.next().await {
+                                    match event {
+                                        Err(error) => {
+                                            assert!(reject);
+                                            assert_eq!(
+                                                error.status,
+                                                axum::http::StatusCode::BAD_GATEWAY
+                                            );
+                                            assert_eq!(
+                                                error.message,
+                                                "upstream completed without any text, refusal or tool call; nothing to return"
+                                            );
+                                            failed = true;
+                                        }
+                                        Ok(ApiEvent::ChatCompletions(chunk)) => {
+                                            assert!(!failed);
+                                            if reject {
+                                                assert_ne!(
+                                                    chunk["choices"],
+                                                    json!([]),
+                                                    "no usage trailer on failure"
+                                                );
+                                                assert!(chunk["usage"].is_null());
+                                            }
+                                            let delta = &chunk["choices"][0]["delta"];
+                                            for field in ["content", "refusal"] {
+                                                if let Some(text) = delta[field].as_str() {
+                                                    let accumulated =
+                                                        message[field].as_str().unwrap().to_owned()
+                                                            + text;
+                                                    message[field] = json!(accumulated);
+                                                }
+                                            }
+                                            if let Some(calls) = delta["tool_calls"].as_array() {
+                                                for call in calls {
+                                                    let index =
+                                                        call["index"].as_u64().unwrap() as usize;
+                                                    if call.get("id").is_some() {
+                                                        assert_eq!(
+                                                            index,
+                                                            message["tool_calls"]
+                                                                .as_array()
+                                                                .unwrap()
+                                                                .len()
+                                                        );
+                                                        let mut call = call.clone();
+                                                        call.as_object_mut()
+                                                            .unwrap()
+                                                            .remove("index");
+                                                        message["tool_calls"]
+                                                            .as_array_mut()
+                                                            .unwrap()
+                                                            .push(call);
+                                                    } else {
+                                                        let arguments = message["tool_calls"]
+                                                            [index]["function"]["arguments"]
+                                                            .as_str()
+                                                            .unwrap()
+                                                            .to_owned()
+                                                            + call["function"]["arguments"]
+                                                                .as_str()
+                                                                .unwrap();
+                                                        message["tool_calls"][index]["function"]
+                                                            ["arguments"] = json!(arguments);
+                                                    }
+                                                }
+                                            }
+                                            if !chunk["choices"][0]["finish_reason"].is_null() {
+                                                finished = true;
+                                                assert_eq!(
+                                                    chunk["choices"][0]["finish_reason"],
+                                                    chat_response(fixture, "codex/gpt-native")
+                                                        .unwrap()["choices"][0]["finish_reason"]
+                                                );
+                                            }
+                                        }
+                                        Ok(ApiEvent::Done) => done = true,
+                                        Ok(ApiEvent::Responses(event)) => {
+                                            if event["type"] == "response.completed"
+                                                || event["type"] == "response.incomplete"
+                                            {
+                                                finished = true;
+                                                assert_eq!(
+                                                    event["response"]["output"],
+                                                    fixture["output"]
+                                                );
+                                            }
+                                        }
+                                        _ => panic!("unexpected API event"),
+                                    }
+                                }
+                                assert_eq!(failed, reject);
+                                assert_eq!(finished, !reject);
+                                // ApiEvent::Done is the sole source of Chat's wire [DONE].
+                                assert_eq!(done, !reject && format == ApiFormat::ChatCompletions);
+                                if !reject && format == ApiFormat::ChatCompletions {
+                                    let expected =
+                                        chat_response(fixture, "codex/gpt-native").unwrap();
+                                    let expected = &expected["choices"][0]["message"];
+                                    for field in ["content", "refusal"] {
+                                        assert_eq!(
+                                            message[field].as_str().unwrap(),
+                                            expected[field].as_str().unwrap_or("")
+                                        );
+                                    }
+                                    assert_eq!(
+                                        message["tool_calls"],
+                                        expected
+                                            .get("tool_calls")
+                                            .cloned()
+                                            .unwrap_or_else(|| json!([]))
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        expected_requests,
+        "no failed completion is retried"
+    );
+    task.abort();
+    std::fs::remove_dir_all(directory).unwrap();
 }

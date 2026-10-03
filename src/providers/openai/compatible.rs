@@ -314,6 +314,15 @@ fn chat_response(response: &Value, model: &str) -> Result<Value> {
             }
         }
     }
+    if response["status"] == "completed"
+        && content.is_empty()
+        && refusal.is_empty()
+        && tools.is_empty()
+    {
+        return Err(Error::upstream(
+            "upstream completed without any text, refusal or tool call; nothing to return",
+        ));
+    }
     let reason = if response["status"] == "incomplete" {
         match response["incomplete_details"]["reason"].as_str() {
             Some("max_output_tokens") => "length",
