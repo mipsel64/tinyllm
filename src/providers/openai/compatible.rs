@@ -314,6 +314,7 @@ fn chat_response(response: &Value, model: &str) -> Result<Value> {
             }
         }
     }
+    // This Chat adapter requires usable output; native Responses permits completed no-ops.
     if response["status"] == "completed"
         && content.is_empty()
         && refusal.is_empty()

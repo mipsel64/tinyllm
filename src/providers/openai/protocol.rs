@@ -888,7 +888,6 @@ pub fn response(response: &Value, alias: &str) -> Result<AnthropicResponse> {
     // A completed turn carrying only reasoning is not something the client can
     // act on, and as a success it would surface as the model silently saying
     // nothing. Fail loudly instead.
-    // TODO: errors rather than retrying; retry upstream if these turn out common.
     if response["status"] == "completed"
         && !content.iter().any(|block| match block {
             // Empty text is as unusable as no text at all.
